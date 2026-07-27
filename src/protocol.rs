@@ -62,12 +62,10 @@ mod tests {
         let ok = super::tool_success(&json!(1), &json!({"nodes": 5}), true);
         assert_eq!(ok["result"]["isError"], false);
         assert_eq!(ok["result"]["structuredContent"]["nodes"], 5);
-        assert!(
-            ok["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("nodes")
-        );
+        assert!(ok["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nodes"));
 
         let flat = super::tool_success(&json!(2), &json!({"nodes": 5}), false);
         assert!(flat["result"].get("structuredContent").is_none());
