@@ -1,7 +1,7 @@
 use crate::{
     negotiate_protocol_version, ServerIdentity, ToolReply, ToolServer, DEFAULT_PROTOCOL_VERSION,
 };
-use blazingly_json::{from_str, CanonicalScanner, JsonCursor, RawJson, RawValue, Value};
+use blazingly_json::{from_str, CanonicalScanner, JsonCursor, RawJson, Value};
 use serde::de::{Deserialize, Deserializer, Visitor};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -118,20 +118,18 @@ struct Route<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum CanonicalControl<'a> {
+enum CanonicalRequest<'a> {
     Ping(RequestId<'a>),
     Initialize {
         id: RequestId<'a>,
         protocol_version: &'a str,
     },
     ToolsList(RequestId<'a>),
-}
-
-#[derive(Clone, Copy)]
-struct CanonicalToolCall<'a> {
-    id: RequestId<'a>,
-    name: &'a str,
-    arguments: RawJson<'a>,
+    ToolCall {
+        id: RequestId<'a>,
+        name: &'a str,
+        arguments: RawJson<'a>,
+    },
 }
 
 #[derive(Serialize)]
@@ -195,40 +193,18 @@ struct ToolResult<'a> {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SerializedToolResult<'a> {
-    content: [TextContent<'a>; 1],
-    is_error: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    structured_content: Option<&'a RawValue>,
-}
-
-#[derive(Serialize)]
 struct TextContent<'a> {
     r#type: &'static str,
     text: &'a str,
 }
-
-#[derive(Serialize)]
-struct Empty {}
 
 pub(crate) fn dispatch_line(
     server: &mut impl ToolServer,
     line: &str,
     writer: &mut impl Write,
 ) -> io::Result<bool> {
-    if let Some(control) = recognize_control(line) {
-        write_canonical_control(server, writer, control)?;
-        return Ok(true);
-    }
-    if let Some(call) = recognize_tool_call(line) {
-        write_tool_call(
-            server,
-            writer,
-            call.id,
-            Some(call.name),
-            Some(call.arguments),
-        )?;
+    if let Some(request) = recognize_canonical(line) {
+        write_canonical_request(server, writer, request)?;
         return Ok(true);
     }
 
@@ -326,21 +302,7 @@ fn parse_route(line: &str) -> blazingly_json::Result<Route<'_>> {
     Ok(route)
 }
 
-fn recognize_control(line: &str) -> Option<CanonicalControl<'_>> {
-    recognize_ping(line)
-        .or_else(|| recognize_initialize(line))
-        .or_else(|| recognize_tools_list(line))
-}
-
-fn recognize_ping(line: &str) -> Option<CanonicalControl<'_>> {
-    recognize_id_and_suffix(line, r#","method":"ping"}"#).map(CanonicalControl::Ping)
-}
-
-fn recognize_tools_list(line: &str) -> Option<CanonicalControl<'_>> {
-    recognize_id_and_suffix(line, r#","method":"tools/list"}"#).map(CanonicalControl::ToolsList)
-}
-
-fn recognize_tool_call(line: &str) -> Option<CanonicalToolCall<'_>> {
+fn recognize_canonical(line: &str) -> Option<CanonicalRequest<'_>> {
     let mut scanner = CanonicalScanner::new(line);
     scanner.literal(r#"{"jsonrpc":"2.0","id":"#)?;
     let id = if scanner.remaining().starts_with('"') {
@@ -348,94 +310,61 @@ fn recognize_tool_call(line: &str) -> Option<CanonicalToolCall<'_>> {
     } else {
         RequestId::Unsigned(scanner.unsigned()?)
     };
-    scanner.literal(r#","method":"tools/call","params":{"name":"#)?;
-    let name = scanner.plain_string()?;
-    scanner.literal(r#","arguments":"#)?;
-    let arguments = scanner.remaining().strip_suffix("}}")?;
-    let arguments = from_str::<RawJson<'_>>(arguments).ok()?;
-    Some(CanonicalToolCall {
-        id,
-        name,
-        arguments,
-    })
-}
-
-fn recognize_initialize(line: &str) -> Option<CanonicalControl<'_>> {
-    let suffix = r#","method":"initialize","params":{"protocolVersion":"#;
-
-    let mut scanner = CanonicalScanner::new(line);
-    if scanner.literal(r#"{"jsonrpc":"2.0","id":"#).is_some()
-        && scanner.remaining().starts_with('"')
-    {
-        let id = scanner.plain_string()?;
-        scanner.literal(suffix)?;
-        let protocol_version = scanner.plain_string()?;
-        scanner.literal("}}")?;
-        if scanner.is_finished() {
-            return Some(CanonicalControl::Initialize {
-                id: RequestId::String(id),
-                protocol_version,
-            });
+    match scanner.remaining() {
+        r#","method":"ping"}"# => Some(CanonicalRequest::Ping(id)),
+        r#","method":"tools/list"}"# => Some(CanonicalRequest::ToolsList(id)),
+        remaining
+            if remaining.starts_with(r#","method":"initialize","params":{"protocolVersion":"#) =>
+        {
+            scanner.literal(r#","method":"initialize","params":{"protocolVersion":"#)?;
+            let protocol_version = scanner.plain_string()?;
+            scanner.literal("}}")?;
+            scanner
+                .is_finished()
+                .then_some(CanonicalRequest::Initialize {
+                    id,
+                    protocol_version,
+                })
         }
-    }
-
-    let mut scanner = CanonicalScanner::new(line);
-    scanner.literal(r#"{"jsonrpc":"2.0","id":"#)?;
-    let id = scanner.unsigned()?;
-    scanner.literal(suffix)?;
-    let protocol_version = scanner.plain_string()?;
-    scanner.literal("}}")?;
-    scanner
-        .is_finished()
-        .then_some(CanonicalControl::Initialize {
-            id: RequestId::Unsigned(id),
-            protocol_version,
-        })
-}
-
-fn recognize_id_and_suffix<'a>(line: &'a str, suffix: &str) -> Option<RequestId<'a>> {
-    let mut scanner = CanonicalScanner::new(line);
-    if scanner.literal(r#"{"jsonrpc":"2.0","id":"#).is_some()
-        && scanner.remaining().starts_with('"')
-    {
-        let id = scanner.plain_string()?;
-        scanner.literal(suffix)?;
-        if scanner.is_finished() {
-            return Some(RequestId::String(id));
+        remaining if remaining.starts_with(r#","method":"tools/call","params":{"name":"#) => {
+            scanner.literal(r#","method":"tools/call","params":{"name":"#)?;
+            let name = scanner.plain_string()?;
+            scanner.literal(r#","arguments":"#)?;
+            let arguments = scanner.remaining().strip_suffix("}}")?;
+            let arguments = from_str::<RawJson<'_>>(arguments).ok()?;
+            Some(CanonicalRequest::ToolCall {
+                id,
+                name,
+                arguments,
+            })
         }
+        _ => None,
     }
-
-    let mut scanner = CanonicalScanner::new(line);
-    scanner.literal(r#"{"jsonrpc":"2.0","id":"#)?;
-    let id = scanner.unsigned()?;
-    scanner.literal(suffix)?;
-    scanner.is_finished().then_some(RequestId::Unsigned(id))
 }
 
-fn write_canonical_control(
+fn write_canonical_request(
     server: &mut impl ToolServer,
     writer: &mut impl Write,
-    control: CanonicalControl<'_>,
+    request: CanonicalRequest<'_>,
 ) -> io::Result<()> {
-    match control {
-        CanonicalControl::Ping(id) => write_empty(writer, id),
-        CanonicalControl::Initialize {
+    match request {
+        CanonicalRequest::Ping(id) => write_empty(writer, id),
+        CanonicalRequest::Initialize {
             id,
             protocol_version,
         } => write_initialize(server, writer, id, protocol_version),
-        CanonicalControl::ToolsList(id) => write_tools_list(server, writer, id),
+        CanonicalRequest::ToolsList(id) => write_tools_list(server, writer, id),
+        CanonicalRequest::ToolCall {
+            id,
+            name,
+            arguments,
+        } => write_tool_call(server, writer, id, Some(name), Some(arguments)),
     }
 }
 
 fn write_empty(writer: &mut impl Write, id: RequestId<'_>) -> io::Result<()> {
-    write(
-        writer,
-        &Response {
-            jsonrpc: "2.0",
-            id,
-            result: Empty {},
-        },
-    )
+    write_response_start(writer, id)?;
+    finish_response(writer, b"{}")
 }
 
 fn write_initialize(
@@ -485,6 +414,12 @@ fn write_tools_list(
     writer: &mut impl Write,
     id: RequestId<'_>,
 ) -> io::Result<()> {
+    if let Some(catalog) = server.catalog_raw_ref() {
+        write_response_start(writer, id)?;
+        writer.write_all(br#"{"tools":"#)?;
+        writer.write_all(catalog.get().as_bytes())?;
+        return finish_response(writer, b"}");
+    }
     if let Some(catalog) = server.catalog_ref() {
         return write_tool_list(writer, id, catalog);
     }
@@ -545,21 +480,17 @@ fn write_tool_call(
                 },
             )
         }
-        ToolReply::Serialized { value, structured } => write(
-            writer,
-            &Response {
-                jsonrpc: "2.0",
-                id,
-                result: SerializedToolResult {
-                    content: [TextContent {
-                        r#type: "text",
-                        text: value.get(),
-                    }],
-                    is_error: false,
-                    structured_content: structured.then_some(value.as_ref()),
-                },
-            },
-        ),
+        ToolReply::Serialized { value, structured } => {
+            write_response_start(writer, id)?;
+            writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
+            blazingly_json::to_writer(&mut *writer, &value.get())?;
+            writer.write_all(br#"}],"isError":false"#)?;
+            if structured {
+                writer.write_all(br#","structuredContent":"#)?;
+                writer.write_all(value.get().as_bytes())?;
+            }
+            finish_response(writer, b"}")
+        }
         ToolReply::Error(message) => write(
             writer,
             &Response {
@@ -603,52 +534,74 @@ fn write(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     writer.flush()
 }
 
+fn write_response_start(writer: &mut impl Write, id: RequestId<'_>) -> io::Result<()> {
+    writer.write_all(br#"{"jsonrpc":"2.0","id":"#)?;
+    blazingly_json::to_writer(&mut *writer, &id)?;
+    writer.write_all(br#","result":"#)
+}
+
+fn finish_response(writer: &mut impl Write, result_suffix: &[u8]) -> io::Result<()> {
+    writer.write_all(result_suffix)?;
+    writer.write_all(b"}\n")?;
+    writer.flush()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_route, recognize_control, recognize_tool_call, CanonicalControl, RequestId};
+    use super::{parse_route, recognize_canonical, CanonicalRequest, RequestId};
 
     #[test]
     fn recognizes_compact_control_messages_and_rejects_near_misses() {
         assert!(matches!(
-            recognize_control(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#),
-            Some(CanonicalControl::Ping(RequestId::Unsigned(7)))
+            recognize_canonical(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#),
+            Some(CanonicalRequest::Ping(RequestId::Unsigned(7)))
         ));
         assert!(matches!(
-            recognize_control(
+            recognize_canonical(
                 r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#
             ),
-            Some(CanonicalControl::Initialize {
+            Some(CanonicalRequest::Initialize {
                 protocol_version: "2025-06-18",
                 ..
             })
         ));
-        assert!(recognize_control(r#"{"id":7,"jsonrpc":"2.0","method":"ping"}"#).is_none());
-        assert!(recognize_control(r#"{"jsonrpc": "2.0","id":7,"method":"ping"}"#).is_none());
+        assert!(recognize_canonical(r#"{"id":7,"jsonrpc":"2.0","method":"ping"}"#).is_none());
+        assert!(recognize_canonical(r#"{"jsonrpc": "2.0","id":7,"method":"ping"}"#).is_none());
     }
 
     #[test]
     fn recognizes_only_complete_canonical_tool_calls() {
-        let call = recognize_tool_call(
+        let call = recognize_canonical(
             r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"echo","arguments":{"ok":true}}}"#,
         )
         .unwrap();
-        assert!(matches!(call.id, RequestId::String("a")));
-        assert_eq!(call.name, "echo");
-        assert_eq!(call.arguments.get(), r#"{"ok":true}"#);
+        let CanonicalRequest::ToolCall {
+            id,
+            name,
+            arguments,
+        } = call
+        else {
+            panic!("expected canonical tool call");
+        };
+        assert!(matches!(id, RequestId::String("a")));
+        assert_eq!(name, "echo");
+        assert_eq!(arguments.get(), r#"{"ok":true}"#);
 
-        assert!(recognize_tool_call(
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":[1,2]}}"#,
-        )
-        .is_some());
-        assert!(recognize_tool_call(
+        assert!(matches!(
+            recognize_canonical(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":[1,2]}}"#,
+            ),
+            Some(CanonicalRequest::ToolCall { .. })
+        ));
+        assert!(recognize_canonical(
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"arguments":{},"name":"echo"}}"#,
         )
         .is_none());
-        assert!(recognize_tool_call(
+        assert!(recognize_canonical(
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ec\u0068o","arguments":{}}}"#,
         )
         .is_none());
-        assert!(recognize_tool_call(
+        assert!(recognize_canonical(
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"unterminated":}}"#,
         )
         .is_none());

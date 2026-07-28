@@ -32,13 +32,65 @@ relative advantage remained stable.
 
 | Complete request/response | Direct mcport | Original owned-DOM path | Speedup |
 | --- | ---: | ---: | ---: |
-| ping | 84.43-120.88 ns | 1,073.72-1,693.27 ns | 12.72-14.01x |
-| initialize | 592.39-1,034.92 ns | 6,292.58-10,608.02 ns | 10.25-13.99x |
-| tools/list | 2,292.16-4,646.66 ns | 8,095.18-18,941.93 ns | 3.53-4.08x |
-| tools/call | 2,324.78-6,869.06 ns | 7,640.71-25,366.39 ns | 3.29-3.69x |
+| ping | 23.55-27.55 ns | 707.21-863.02 ns | 29.65-34.41x |
+| initialize | 402.84-531.14 ns | 4,565.21-5,119.87 ns | 9.19-12.49x |
+| tools/list | 2,128.22-2,736.24 ns | 7,877.45-9,916.41 ns | 3.62-3.78x |
+| tools/call | 2,150.33-2,332.38 ns | 8,409.90-8,739.66 ns | 3.66-3.97x |
 
-A typed builder handler is another 1.26-1.34x faster than the already-fast
+A typed builder handler is another 1.31-1.35x faster than the already-fast
 `Value` handler for the measured tool call.
+
+### Full-process competitor benchmark
+
+The committed black-box harness also compares complete release binaries over
+real stdin/stdout pipes. It uses `mcport 0.1.0`, the official Rust SDK
+`rmcp 0.16.0`, and `rust-mcp-sdk 1.0.1`. Each server receives an initialize
+handshake followed by 10,000 uniquely identified requests. Every complete run
+warms each binary once, rotates server order across five measured rounds, and
+reports the median.
+
+These are ranges across three complete runs on the same Windows machine:
+
+| Workload | Server | Median latency | Throughput | Versus mcport |
+| --- | --- | ---: | ---: | ---: |
+| tools/list | mcport | 4.41-5.67 us | 176,410-226,858 req/s | 1.00x |
+| tools/list | rmcp 0.16.0 | 71.12-100.79 us | 9,922-14,060 req/s | 15.97-17.78x slower |
+| tools/list | rust-mcp-sdk 1.0.1 | 107.23-139.74 us | 7,156-9,326 req/s | 24.33-25.43x slower |
+| tools/call | mcport | 7.01-7.75 us | 129,047-142,698 req/s | 1.00x |
+| tools/call | rmcp 0.16.0 | 61.84-96.21 us | 10,394-16,172 req/s | 8.82-12.71x slower |
+| tools/call | rust-mcp-sdk 1.0.1 | 101.87-147.12 us | 6,797-9,816 req/s | 13.15-19.44x slower |
+
+The harness validates the final response from every warmup: `tools/list` must
+contain `query_graph`, while `tools/call` must reproduce all four structured
+fields. It also rejects any protocol error and requires exactly 10,001
+responses per process. `tools/list` emits the same 288.9 average bytes per
+response in all three implementations. For `tools/call`, mcport and rmcp emit
+259.9 bytes while rust-mcp-sdk emits 243.9 bytes; mcport is not winning by
+omitting the explicit `isError: false` field.
+
+With identical thin-LTO release settings, the benchmark binaries are:
+
+| Binary | Size |
+| --- | ---: |
+| mcport | 545,792 bytes |
+| rmcp 0.16.0 | 1,633,280 bytes |
+| rust-mcp-sdk 1.0.1 | 1,654,272 bytes |
+
+The competitor SDKs intentionally live only in
+`benchmarks/competitors`, which the published crate excludes. Their Tokio and
+`serde_json` dependencies never enter mcport's normal dependency graph.
+
+Run the black-box harness:
+
+```text
+cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+benchmarks/competitors/target/release/bench-runner
+```
+
+This is a selected local tools-only stdio workload, not a claim that mcport
+implements the broader feature sets of either SDK. The benchmark includes
+process startup, OS pipes, each runtime and codec, dispatch, handler work, and
+complete response output.
 
 ### What the benchmark measures
 
@@ -65,18 +117,18 @@ nanoseconds for capacity planning.
 
 Why the direct path wins:
 
-- compact `ping`, `initialize`, and `tools/list` messages use an exact
-  zero-allocation recognizer;
-- the common compact `tools/call` layout has an exact recognizer that borrows
-  its validated arguments;
+- compact `ping`, `initialize`, `tools/list`, and `tools/call` share one exact
+  zero-allocation recognizer that parses the common prefix and request id once;
 - reordered, spaced, or escaped input falls back to the strict
   order-independent `JsonCursor`;
 - routing fields and raw tool arguments borrow from the input line;
 - typed/raw handlers skip an intermediate mutable JSON DOM;
 - `ToolReply::structured` serializes an arbitrary Serde result once into a
   `RawValue`, then reuses the same bytes for text and `structuredContent`;
-- responses serialize directly from borrowed structs;
-- the builder lends its identity and catalog instead of cloning them;
+- canonical response envelopes are written directly;
+- the builder lends its identity and validated pre-serialized catalog instead
+  of cloning or repeatedly serializing them;
+- the stdio loop reuses one input buffer for the full session;
 - structurally unusual but valid legacy requests fall back to the public
   owned dispatcher, preserving response semantics.
 
@@ -210,9 +262,9 @@ impl ToolServer for Echo {
 }
 ```
 
-`ToolServer::call_raw`, `identity_ref`, and `catalog_ref` have compatible
-defaults. Existing implementations do not need to define them; optimized
-implementations can override them.
+`ToolServer::call_raw`, `identity_ref`, `catalog_ref`, and `catalog_raw_ref`
+have compatible defaults. Existing implementations do not need to define
+them; optimized implementations can override them.
 
 ## Embedding
 
@@ -327,16 +379,17 @@ cargo test --locked
 cargo clippy --all-targets -- -D warnings
 cargo +1.78 build --locked
 cargo bench --bench runtime
+cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+benchmarks/competitors/target/release/bench-runner
 ```
 
 CI covers Linux, Windows, macOS, and Rust 1.78.
 
-## Name and release
+## Release
 
-As of July 28, 2026, the exact `mcport` name has no published crate in the
-crates.io API. The first release is intentionally held until
-`blazingly-json` is published and this repository passes its final package
-verification against the registry version.
+Version `0.1.0` is the first public release. It resolves `blazingly-json`
+through crates.io, and the publish workflow repeats `cargo publish --dry-run`
+before uploading the immutable crate.
 
 ## License
 

@@ -1,0 +1,36 @@
+[package]
+name = "mcport-competitor-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+mcport = { path = "../.." }
+rmcp = { version = "0.16.0", default-features = false, features = ["server", "transport-io"] }
+rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "macros", "stdio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+
+[[bin]]
+name = "bench-runner"
+path = "src/runner.rs"
+
+[[bin]]
+name = "mcport-server"
+path = "src/mcport_server.rs"
+
+[[bin]]
+name = "rmcp-server"
+path = "src/rmcp_server.rs"
+
+[[bin]]
+name = "rust-mcp-sdk-server"
+path = "src/rust_mcp_sdk_server.rs"

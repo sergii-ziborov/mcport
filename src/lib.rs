@@ -211,6 +211,15 @@ pub trait ToolServer {
         None
     }
 
+    /// Borrows a compact, validated serialization of the catalog.
+    ///
+    /// Builder-backed servers use this to splice immutable schemas directly
+    /// into `tools/list` responses instead of serializing the same catalog on
+    /// every request.
+    fn catalog_raw_ref(&mut self) -> Option<&RawValue> {
+        None
+    }
+
     /// Reports whether a tool name is registered when the server can know
     /// without invoking it.
     ///
@@ -259,11 +268,21 @@ pub fn serve(server: &mut impl ToolServer) -> io::Result<()> {
 /// Returns only stream I/O failures.
 pub fn serve_streams(
     server: &mut impl ToolServer,
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::with_capacity(512);
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
         serve_message(server, &line, &mut writer)?;
     }
     Ok(())
@@ -579,6 +598,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":8,"method":"tools/call"}"#,
             r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":null}"#,
             r#"{"jsonrpc":"2.0","id":10,"method":false}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"text":"quote: \" slash: \\ newline: \n snowman: ☃"}}}"#,
             r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
             r#"{"jsonrpc":"2.0","id":{"legacy":true},"method":"ping"}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,

@@ -1,5 +1,5 @@
 use crate::{serve, serve_streams, ServerIdentity, ToolReply, ToolServer};
-use blazingly_json::{from_str, Map, RawJson, Value};
+use blazingly_json::{from_str, Map, RawJson, RawValue, Value};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -18,6 +18,7 @@ pub struct McpServer<S = ()> {
     identity: ServerIdentity,
     state: S,
     catalog: Value,
+    catalog_raw: Option<Box<RawValue>>,
     tools: HashMap<String, Handler<S>>,
 }
 
@@ -95,6 +96,7 @@ impl<S> McpServer<S> {
             identity,
             state,
             catalog: Value::Array(Vec::new()),
+            catalog_raw: None,
             tools: HashMap::new(),
         }
     }
@@ -208,6 +210,7 @@ impl<S> McpServer<S> {
         } else {
             catalog.push(descriptor);
         }
+        self.catalog_raw = blazingly_json::to_raw_value(&self.catalog).ok();
     }
 
     fn call_handler(&mut self, name: &str, arguments: Value) -> ToolReply {
@@ -252,6 +255,10 @@ impl<S> ToolServer for McpServer<S> {
 
     fn catalog_ref(&mut self) -> Option<&Value> {
         Some(&self.catalog)
+    }
+
+    fn catalog_raw_ref(&mut self) -> Option<&RawValue> {
+        self.catalog_raw.as_deref()
     }
 
     fn has_tool(&self, name: &str) -> Option<bool> {
@@ -353,6 +360,15 @@ mod tests {
         let catalog = server.catalog();
         assert_eq!(catalog.as_array().map(Vec::len), Some(1));
         assert_eq!(catalog[0]["description"], "New.");
+        let mut output = Vec::new();
+        serve_message(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
+            &mut output,
+        )
+        .unwrap();
+        let listed = blazingly_json::from_slice::<Value>(&output).unwrap();
+        assert_eq!(listed["result"]["tools"][0]["description"], "New.");
         let ToolReply::Serialized { value, .. } = server.call("echo", json!({})) else {
             panic!("echo must succeed");
         };
