@@ -4,13 +4,30 @@
 //! newline-delimited JSON-RPC message, the server answers on stdout. There is
 //! no multiplexing to schedule, so this crate deliberately ships no async
 //! executor. The entire runtime is a blocking read loop over `std::io`, and
-//! its only dependency is `serde_json`.
+//! its protocol path uses `blazingly-json` without Tokio, Hyper, or Axum.
 //!
-//! Implement [`ToolServer`] for your tool surface and hand it to [`serve`]:
+//! Small servers can register tools directly:
 //!
 //! ```no_run
-//! use serde_json::{Value, json};
-//! use weavatrix_mcp::{ServerIdentity, ToolReply, ToolServer};
+//! use mcport::{json, McpServer, ToolReply};
+//!
+//! fn main() -> std::io::Result<()> {
+//!     let mut server = McpServer::new("echo", "1.0.0")
+//!         .instructions("Echoes tool arguments back.")
+//!         .tool(
+//!             "echo",
+//!             "Echo the arguments.",
+//!             json!({"type": "object", "additionalProperties": true}),
+//!             ToolReply::structured,
+//!         );
+//!     server.serve()
+//! }
+//! ```
+//!
+//! Implement [`ToolServer`] when dispatch needs a fully custom static surface:
+//!
+//! ```no_run
+//! use mcport::{json, ServerIdentity, ToolReply, ToolServer, Value};
 //!
 //! struct Echo;
 //!
@@ -36,7 +53,7 @@
 //! }
 //!
 //! fn main() -> std::io::Result<()> {
-//!     weavatrix_mcp::serve(&mut Echo)
+//!     mcport::serve(&mut Echo)
 //! }
 //! ```
 //!
@@ -50,13 +67,37 @@
 //! - malformed JSON, missing methods, and unknown methods produce JSON-RPC
 //!   errors without terminating the loop.
 
+mod builder;
+mod fast;
 pub mod protocol;
 
-use serde_json::{json, Value};
+pub use blazingly_json::{json, Map, RawJson, RawValue, Value};
+pub use builder::McpServer;
+
+use serde::Serialize;
 use std::io::{self, BufRead, Write};
 
-/// Protocol revision negotiated when the client does not request one.
-pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Latest stable protocol revision implemented by the runtime.
+pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Stable protocol revisions accepted by this runtime.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+
+/// Chooses a supported protocol revision for an initialize response.
+///
+/// A supported client revision is echoed. Unknown or missing revisions receive
+/// the latest stable revision so the client can decide whether to continue.
+#[must_use]
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|requested| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|supported| *supported == requested)
+        })
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION)
+}
 
 /// Identity block reported from `initialize`.
 #[derive(Debug, Clone)]
@@ -94,26 +135,48 @@ pub enum ToolReply {
         /// Whether to also attach `structuredContent`.
         structured: bool,
     },
+    /// Pre-serialized tool output used by the fast response path.
+    Serialized {
+        /// One complete validated JSON value.
+        value: Box<RawValue>,
+        /// Whether to also attach the object as `structuredContent`.
+        structured: bool,
+    },
     /// Tool failure reported as `isError: true` content, not a protocol error.
     Error(String),
 }
 
 impl ToolReply {
     /// Success carrying both text and `structuredContent`.
+    ///
+    /// Any serializable result is accepted; handlers do not need to build a
+    /// JSON [`Value`] first.
     #[must_use]
-    pub fn structured(value: Value) -> Self {
-        Self::Success {
-            value,
-            structured: true,
-        }
+    pub fn structured(value: impl Serialize) -> Self {
+        Self::success(value, true)
     }
 
     /// Success carrying compact text content only.
+    ///
+    /// Any serializable result is accepted.
     #[must_use]
-    pub fn text(value: Value) -> Self {
-        Self::Success {
-            value,
-            structured: false,
+    pub fn text(value: impl Serialize) -> Self {
+        Self::success(value, false)
+    }
+
+    /// Serializes a successful tool result once.
+    ///
+    /// `structured` is honored only for object-shaped JSON because MCP
+    /// requires `structuredContent` to have an object root. Other values still
+    /// succeed as text content.
+    #[must_use]
+    pub fn success(value: impl Serialize, structured: bool) -> Self {
+        match blazingly_json::to_raw_value(&value) {
+            Ok(value) => Self::Serialized {
+                structured: structured && value.get().starts_with('{'),
+                value,
+            },
+            Err(error) => Self::Error(format!("tool result serialization failed: {error}")),
         }
     }
 
@@ -129,11 +192,49 @@ pub trait ToolServer {
     /// Identity reported from `initialize`.
     fn identity(&self) -> ServerIdentity;
 
+    /// Borrows the identity when the implementation stores it.
+    ///
+    /// The default preserves source compatibility with existing
+    /// implementations. Returning a reference avoids three string clones
+    /// during initialization.
+    fn identity_ref(&self) -> Option<&ServerIdentity> {
+        None
+    }
+
     /// Tool catalog returned from `tools/list`, as a JSON array.
     fn catalog(&mut self) -> Value;
 
+    /// Borrows the catalog when the implementation stores it.
+    ///
+    /// Returning a reference avoids cloning the complete schema list.
+    fn catalog_ref(&mut self) -> Option<&Value> {
+        None
+    }
+
+    /// Reports whether a tool name is registered when the server can know
+    /// without invoking it.
+    ///
+    /// Returning `Some(false)` lets mcport emit a protocol-level invalid
+    /// params error for an unknown tool, as required by MCP. The compatibility
+    /// default leaves custom dispatch implementations authoritative.
+    fn has_tool(&self, _name: &str) -> Option<bool> {
+        None
+    }
+
     /// Dispatches one tool call.
     fn call(&mut self, name: &str, arguments: Value) -> ToolReply;
+
+    /// Dispatches validated raw arguments without constructing a JSON DOM.
+    ///
+    /// Existing implementations inherit a compatible default that decodes a
+    /// [`Value`] and calls [`ToolServer::call`]. Typed builders override this
+    /// method and deserialize directly into the handler input.
+    fn call_raw(&mut self, name: &str, arguments: RawJson<'_>) -> ToolReply {
+        match arguments.deserialize::<Value>() {
+            Ok(arguments) => self.call(name, arguments),
+            Err(error) => ToolReply::error(format!("invalid arguments for {name}: {error}")),
+        }
+    }
 }
 
 /// Serves a [`ToolServer`] over process stdin/stdout until EOF.
@@ -163,20 +264,30 @@ pub fn serve_streams(
 ) -> io::Result<()> {
     for line in reader.lines() {
         let line = line?;
-        let line = line.trim_start_matches('\u{feff}');
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Value>(line) {
-            Ok(request) => match dispatch(server, &request) {
-                Some(response) => response,
-                None => continue,
-            },
-            Err(error) => protocol::error(&Value::Null, -32_700, error.to_string()),
-        };
-        write_message(&mut writer, &response)?;
+        serve_message(server, &line, &mut writer)?;
     }
     Ok(())
+}
+
+/// Processes one newline-free JSON-RPC message.
+///
+/// Returns `true` when a response was written and `false` for an empty line or
+/// notification. This is useful for embedding mcport in an existing blocking
+/// transport without giving the runtime ownership of its read loop.
+///
+/// # Errors
+///
+/// Returns only writer failures.
+pub fn serve_message(
+    server: &mut impl ToolServer,
+    line: &str,
+    writer: &mut impl Write,
+) -> io::Result<bool> {
+    let line = line.trim_start_matches('\u{feff}');
+    if line.trim().is_empty() {
+        return Ok(false);
+    }
+    fast::dispatch_line(server, line, writer)
 }
 
 /// Dispatches one parsed JSON-RPC request.
@@ -184,17 +295,35 @@ pub fn serve_streams(
 /// Returns `None` for notifications (requests without an `id`), which must
 /// not be answered.
 pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> {
-    request.get("id")?;
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    if !request.is_object() {
+        return Some(protocol::error(
+            &Value::Null,
+            -32_600,
+            "invalid JSON-RPC request",
+        ));
+    }
+    let id = request.get("id").cloned();
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(protocol::error(
+            id.as_ref().unwrap_or(&Value::Null),
+            -32_600,
+            "invalid JSON-RPC version",
+        ));
+    }
     let Some(method) = request.get("method").and_then(Value::as_str) else {
-        return Some(protocol::error(&id, -32_600, "missing JSON-RPC method"));
+        return Some(protocol::error(
+            id.as_ref().unwrap_or(&Value::Null),
+            -32_600,
+            "missing JSON-RPC method",
+        ));
     };
+    let id = id?;
     Some(match method {
         "initialize" => {
-            let version = request
+            let requested_version = request
                 .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+                .and_then(Value::as_str);
+            let version = negotiate_protocol_version(requested_version);
             let identity = server.identity();
             protocol::success(
                 &id,
@@ -219,6 +348,13 @@ pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> 
                     "tools/call requires params.name",
                 ));
             };
+            if server.has_tool(name) == Some(false) {
+                return Some(protocol::error(
+                    &id,
+                    -32_602,
+                    format!("unknown tool: {name}"),
+                ));
+            }
             let arguments = request
                 .pointer("/params/arguments")
                 .cloned()
@@ -227,6 +363,9 @@ pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> 
                 ToolReply::Success { value, structured } => {
                     protocol::tool_success(&id, &value, structured)
                 }
+                ToolReply::Serialized { value, structured } => {
+                    protocol::tool_success_raw(&id, &value, structured)
+                }
                 ToolReply::Error(message) => protocol::tool_error(&id, message),
             }
         }
@@ -234,16 +373,11 @@ pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> 
     })
 }
 
-fn write_message(writer: &mut impl Write, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, serve_streams, ServerIdentity, ToolReply, ToolServer};
-    use serde_json::{json, Value};
+    use super::{
+        dispatch, json, serve_message, serve_streams, ServerIdentity, ToolReply, ToolServer, Value,
+    };
 
     struct Echo {
         calls: usize,
@@ -299,9 +433,24 @@ mod tests {
             super::DEFAULT_PROTOCOL_VERSION
         );
 
+        let unknown_version = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "initialize",
+                "params": {"protocolVersion": "2099-01-01"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            unknown_version["result"]["protocolVersion"],
+            super::DEFAULT_PROTOCOL_VERSION
+        );
+
         let listed = dispatch(
             &mut server,
-            &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
         )
         .unwrap();
         assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(1));
@@ -310,7 +459,7 @@ mod tests {
             &mut server,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 5,
                 "method": "tools/call",
                 "params": {"name": "echo", "arguments": {"value": 7}}
             }),
@@ -323,7 +472,7 @@ mod tests {
             &mut server,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 5,
+                "id": 6,
                 "method": "tools/call",
                 "params": {"name": "flat", "arguments": {"value": 7}}
             }),
@@ -335,7 +484,7 @@ mod tests {
             &mut server,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 6,
+                "id": 7,
                 "method": "tools/call",
                 "params": {"name": "missing"}
             }),
@@ -350,16 +499,26 @@ mod tests {
         let no_method = dispatch(&mut server, &json!({"jsonrpc": "2.0", "id": 1})).unwrap();
         assert_eq!(no_method["error"]["code"], -32_600);
 
+        let wrong_version = dispatch(
+            &mut server,
+            &json!({"jsonrpc": "1.0", "id": 2, "method": "ping"}),
+        )
+        .unwrap();
+        assert_eq!(wrong_version["error"]["code"], -32_600);
+
+        let non_object = dispatch(&mut server, &json!([])).unwrap();
+        assert_eq!(non_object["error"]["code"], -32_600);
+
         let unknown = dispatch(
             &mut server,
-            &json!({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}),
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
         )
         .unwrap();
         assert_eq!(unknown["error"]["code"], -32_601);
 
         let unnamed = dispatch(
             &mut server,
-            &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call"}),
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call"}),
         )
         .unwrap();
         assert_eq!(unnamed["error"]["code"], -32_602);
@@ -369,6 +528,11 @@ mod tests {
             &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         );
         assert!(notification.is_none(), "notifications are not answered");
+
+        let malformed_notification =
+            dispatch(&mut server, &json!({"jsonrpc": "1.0", "method": "ping"})).unwrap();
+        assert_eq!(malformed_notification["id"], Value::Null);
+        assert_eq!(malformed_notification["error"]["code"], -32_600);
     }
 
     #[test]
@@ -388,14 +552,58 @@ mod tests {
         let lines = lines.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3, "ping, parse error, tool call");
 
-        let ping = serde_json::from_str::<Value>(lines[0]).unwrap();
+        let ping = blazingly_json::from_str::<Value>(lines[0]).unwrap();
         assert_eq!(ping["id"], 1, "BOM-prefixed first request still parses");
 
-        let parse_error = serde_json::from_str::<Value>(lines[1]).unwrap();
+        let parse_error = blazingly_json::from_str::<Value>(lines[1]).unwrap();
         assert_eq!(parse_error["error"]["code"], -32_700);
 
-        let called = serde_json::from_str::<Value>(lines[2]).unwrap();
+        let called = blazingly_json::from_str::<Value>(lines[2]).unwrap();
         assert_eq!(called["result"]["structuredContent"]["ok"], true);
         assert_eq!(server.calls, 1);
+    }
+
+    #[test]
+    fn fast_message_path_preserves_public_dispatch_semantics() {
+        let fixtures = [
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            r#"{"jsonrpc":"2.0","id":"future","method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
+            r#"{"method":"initialize","id":-2,"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"ok":true}}}"#,
+            r#"{"params":{"arguments":[1,2],"name":"fl\u0061t"},"method":"tools/call","id":4,"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"missing"}}"#,
+            r#"{"jsonrpc":"2.0","id":6}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call"}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":null}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":false}"#,
+            r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":{"legacy":true},"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"1.0","method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":false}"#,
+            r"[]",
+        ];
+
+        for fixture in fixtures {
+            let request = blazingly_json::from_str::<Value>(fixture).unwrap();
+            let mut expected_server = Echo { calls: 0 };
+            let expected = dispatch(&mut expected_server, &request);
+
+            let mut actual_server = Echo { calls: 0 };
+            let mut output = Vec::new();
+            let wrote = serve_message(&mut actual_server, fixture, &mut output).unwrap();
+            let actual = if output.is_empty() {
+                None
+            } else {
+                Some(blazingly_json::from_slice::<Value>(&output).unwrap())
+            };
+
+            assert_eq!(wrote, actual.is_some(), "fixture: {fixture}");
+            assert_eq!(actual, expected, "fixture: {fixture}");
+            assert_eq!(actual_server.calls, expected_server.calls);
+        }
     }
 }
