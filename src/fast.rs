@@ -1,7 +1,7 @@
 use crate::{
     negotiate_protocol_version, ServerIdentity, ToolReply, ToolServer, DEFAULT_PROTOCOL_VERSION,
 };
-use blazingly_json::{from_str, CanonicalScanner, Cursor, RawJson, RawValue, Value};
+use blazingly_json::{from_str, CanonicalScanner, JsonCursor, RawJson, RawValue, Value};
 use serde::de::{Deserialize, Deserializer, Visitor};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -291,7 +291,7 @@ pub(crate) fn dispatch_line(
 
 fn parse_route(line: &str) -> blazingly_json::Result<Route<'_>> {
     let mut route = Route::default();
-    let mut cursor = Cursor::from_str(line);
+    let mut cursor = JsonCursor::from_str(line);
     cursor.object(|request| {
         while let Some(field) = request.next_field()? {
             match field.name() {

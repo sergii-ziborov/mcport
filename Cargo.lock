@@ -5,6 +5,8 @@ version = 3
 [[package]]
 name = "blazingly-json"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af6e9703e92d191d4a44c9e7da2ea0aded836b109fdc9a3b9d04146a36f94f7"
 dependencies = [
  "itoa",
  "lexical-core",

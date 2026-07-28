@@ -10,6 +10,17 @@ canonical control-message recognition, and direct response serialization.
 The `mcport` crate contains no Tokio, Hyper, Axum, futures executor, or unsafe
 code.
 
+## Install
+
+```toml
+[dependencies]
+mcport = "0.1.0"
+```
+
+`mcport` uses `blazingly-json` for its public `Value`, `RawJson`, `RawValue`,
+and `json!` surface. Applications can import those types from `mcport` and do
+not need a second direct JSON dependency for MCP handling.
+
 ## Performance
 
 Local Windows measurements on an Intel Core Ultra 7 255U. These are ranges
@@ -29,6 +40,29 @@ relative advantage remained stable.
 A typed builder handler is another 1.26-1.34x faster than the already-fast
 `Value` handler for the measured tool call.
 
+### What the benchmark measures
+
+`benches/runtime.rs` exercises a complete in-memory request/response cycle:
+
+1. accept one UTF-8 JSON-RPC message;
+2. recognize or parse the route;
+3. negotiate/list/dispatch as appropriate;
+4. deserialize tool arguments;
+5. execute the same deterministic handler;
+6. construct and serialize the complete MCP response plus newline.
+
+The `direct` side calls `serve_message`. The comparison side first parses the
+whole request into an owned `Value`, calls the public `dispatch` compatibility
+API, then serializes that owned response. Before timing begins, the harness
+parses both responses and asserts semantic equality.
+
+Each row uses 25,000 operations per round and 24 alternating rounds. The table
+reports ranges of the per-run medians from three complete runs. Output is a
+preallocated `Vec<u8>`, so the numbers isolate runtime/codec cost; they do not
+claim filesystem, process scheduling, pipe, client, or actual tool-work
+latency. Run the benchmark on the deployment machine before using absolute
+nanoseconds for capacity planning.
+
 Why the direct path wins:
 
 - compact `ping`, `initialize`, and `tools/list` messages use an exact
@@ -36,7 +70,7 @@ Why the direct path wins:
 - the common compact `tools/call` layout has an exact recognizer that borrows
   its validated arguments;
 - reordered, spaced, or escaped input falls back to the strict
-  order-independent `Cursor`;
+  order-independent `JsonCursor`;
 - routing fields and raw tool arguments borrow from the input line;
 - typed/raw handlers skip an intermediate mutable JSON DOM;
 - `ToolReply::structured` serializes an arbitrary Serde result once into a
@@ -51,6 +85,9 @@ Run the committed harness:
 ```text
 cargo bench --bench runtime
 ```
+
+For a stable comparison, use a release build, close CPU-heavy work, run the
+harness several times, and compare the ratio as well as absolute latency.
 
 ## Minimal server
 
@@ -185,6 +222,29 @@ implementations can override them.
   wrote a response;
 - `dispatch` retains the owned `Value` API for compatibility and testing.
 
+## Protocol contract
+
+| Input | Result |
+| --- | --- |
+| valid request with `id` | one newline-terminated JSON-RPC response |
+| valid notification without `id` | no response |
+| malformed JSON | `-32700` parse error |
+| malformed JSON-RPC request/version | `-32600` invalid request |
+| unsupported method | `-32601` method not found |
+| missing/unknown tool | `-32602` invalid params |
+| registered handler failure | successful JSON-RPC envelope with MCP `isError: true` |
+
+The fast recognizers accept only complete canonical layouts. They do not
+partially trust lookalike input: reordered fields, whitespace variants, escaped
+names, unusual request IDs, and other valid layouts fall back to the strict
+order-independent `JsonCursor`; malformed inputs fall back far enough to produce
+the same JSON-RPC semantics as `dispatch`.
+
+`ToolReply::structured` accepts any `serde::Serialize` result. It serializes
+once into a validated `RawValue`. Object roots are emitted both as compact text
+and zero-copy `structuredContent`. Arrays, scalars, and null remain text-only
+because the MCP schema requires `structuredContent` to be an object.
+
 ## Runtime behavior
 
 - supports `initialize`, `ping`, `tools/list`, and `tools/call`;
@@ -225,6 +285,39 @@ Direct runtime dependencies:
 `unsafe_code` is forbidden in `mcport`. Its `blazingly-json` dependency keeps
 its small audited unsafe allowance isolated to `raw_value.rs`. Tokio, Hyper,
 Axum, and `serde_json` are absent from the normal dependency tree.
+
+The two direct runtime dependencies are:
+
+- `blazingly-json = 0.1.0`;
+- `serde`, with derive support for typed handlers and response structs.
+
+There are no default-feature switches that silently add a network stack or
+executor.
+
+## Migrating an existing MCP server
+
+Replace the local path once the registry crate is available:
+
+```toml
+# before
+mcport = { version = "0.1.0", path = "../mcport" }
+
+# registry
+mcport = "0.1.0"
+```
+
+For code still importing `serde_json` everywhere, migration can be staged by
+aliasing only the package name first:
+
+```toml
+serde_json = { package = "blazingly-json", version = "0.1.0" }
+```
+
+That preserves existing `serde_json::Value`, `json!`, `from_*`, and `to_*`
+paths while moving them to the new engine. A full `weavatrix-rust
+--all-features` consumer probe with this alias and the released mcport source
+passes 32 tests. This is compatibility evidence, not an automatic edit of the
+consumer repository.
 
 ## Verification
 
