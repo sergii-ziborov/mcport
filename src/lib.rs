@@ -210,6 +210,56 @@ impl ToolReply {
     }
 }
 
+/// Outcome of a non-tool JSON-RPC method handled by a server extension.
+#[derive(Debug, Clone)]
+pub enum MethodReply {
+    /// Successful JSON-RPC result.
+    Success(Value),
+    /// JSON-RPC error with an optional structured data payload.
+    Error {
+        /// JSON-RPC error code.
+        code: i64,
+        /// Human-readable error message.
+        message: String,
+        /// Optional machine-readable error data.
+        data: Option<Value>,
+    },
+}
+
+impl MethodReply {
+    /// Creates a successful extension-method result.
+    #[must_use]
+    pub fn success(value: impl Serialize) -> Self {
+        match blazingly_json::to_value(value) {
+            Ok(value) => Self::Success(value),
+            Err(error) => Self::error(
+                -32_603,
+                format!("method result serialization failed: {error}"),
+            ),
+        }
+    }
+
+    /// Creates a JSON-RPC extension-method error.
+    #[must_use]
+    pub fn error(code: i64, message: impl Into<String>) -> Self {
+        Self::Error {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// Creates a JSON-RPC extension-method error with structured data.
+    #[must_use]
+    pub fn error_with_data(code: i64, message: impl Into<String>, data: impl Serialize) -> Self {
+        Self::Error {
+            code,
+            message: message.into(),
+            data: blazingly_json::to_value(data).ok(),
+        }
+    }
+}
+
 /// One cursor-addressed page returned from `tools/list`.
 #[derive(Debug, Clone)]
 pub struct ToolPage {
@@ -241,6 +291,16 @@ pub trait ToolServer {
     /// implementations. Returning a reference avoids three string clones
     /// during initialization.
     fn identity_ref(&self) -> Option<&ServerIdentity> {
+        None
+    }
+
+    /// Server capabilities reported by initialization and discovery.
+    fn capabilities(&self) -> Value {
+        json!({"tools": {"listChanged": false}})
+    }
+
+    /// Borrows stored server capabilities when available.
+    fn capabilities_ref(&self) -> Option<&Value> {
         None
     }
 
@@ -299,6 +359,13 @@ pub trait ToolServer {
             Ok(arguments) => self.call(name, arguments),
             Err(error) => ToolReply::error(format!("invalid arguments for {name}: {error}")),
         }
+    }
+
+    /// Handles a JSON-RPC method outside the built-in MCP tool surface.
+    ///
+    /// Returning `None` keeps the standard `method not found` response.
+    fn call_method(&mut self, _method: &str, _params: Value) -> Option<MethodReply> {
+        None
     }
 }
 
@@ -453,8 +520,31 @@ pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> 
         "ping" => protocol::success(&id, &json!({})),
         "tools/list" => tools_list_response(server, request, &id, modern),
         "tools/call" => tool_call_response(server, request, &id, modern),
-        _ => protocol::error(&id, -32_601, format!("method not found: {method}")),
+        _ => extension_method_response(server, method, request, &id),
     })
+}
+
+fn extension_method_response(
+    server: &mut impl ToolServer,
+    method: &str,
+    request: &Value,
+    id: &Value,
+) -> Value {
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    match server.call_method(method, params) {
+        Some(MethodReply::Success(result)) => protocol::success(id, &result),
+        Some(MethodReply::Error {
+            code,
+            message,
+            data: Some(data),
+        }) => protocol::error_with_data(id, code, message, data),
+        Some(MethodReply::Error {
+            code,
+            message,
+            data: None,
+        }) => protocol::error(id, code, message),
+        None => protocol::error(id, -32_601, format!("method not found: {method}")),
+    }
 }
 
 fn request_uses_modern_protocol(request: &Value, id: &Value) -> Result<bool, Value> {
@@ -501,11 +591,15 @@ fn initialize_response(server: &impl ToolServer, request: &Value, id: &Value) ->
         .and_then(Value::as_str);
     let version = negotiate_protocol_version(requested_version);
     let identity = server.identity();
+    let capabilities = server
+        .capabilities_ref()
+        .cloned()
+        .unwrap_or_else(|| server.capabilities());
     protocol::success(
         id,
         &json!({
             "protocolVersion": version,
-            "capabilities": {"tools": {"listChanged": false}},
+            "capabilities": capabilities,
             "serverInfo": {
                 "name": identity.name,
                 "version": identity.version
@@ -517,12 +611,16 @@ fn initialize_response(server: &impl ToolServer, request: &Value, id: &Value) ->
 
 fn discover_response(server: &impl ToolServer, id: &Value) -> Value {
     let identity = server.identity();
+    let capabilities = server
+        .capabilities_ref()
+        .cloned()
+        .unwrap_or_else(|| server.capabilities());
     protocol::success(
         id,
         &json!({
             "resultType": "complete",
             "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
-            "capabilities": {"tools": {"listChanged": false}},
+            "capabilities": capabilities,
             "_meta": {
                 "io.modelcontextprotocol/serverInfo": {
                     "name": identity.name,
@@ -594,7 +692,8 @@ fn tools_list_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, json, serve_message, serve_streams, ServerIdentity, ToolReply, ToolServer, Value,
+        dispatch, json, serve_message, serve_streams, MethodReply, ServerIdentity, ToolReply,
+        ToolServer, Value,
     };
 
     struct Echo {
@@ -623,6 +722,93 @@ mod tests {
                 _ => ToolReply::error(format!("unknown tool: {name}")),
             }
         }
+    }
+
+    struct Resources;
+
+    impl ToolServer for Resources {
+        fn identity(&self) -> ServerIdentity {
+            ServerIdentity::new("resources", "1.0.0", "Resource test server.")
+        }
+
+        fn capabilities(&self) -> Value {
+            json!({
+                "tools": {"listChanged": false},
+                "resources": {"subscribe": false, "listChanged": false}
+            })
+        }
+
+        fn catalog(&mut self) -> Value {
+            json!([])
+        }
+
+        fn call(&mut self, name: &str, _arguments: Value) -> ToolReply {
+            ToolReply::error(format!("unknown tool: {name}"))
+        }
+
+        fn call_method(&mut self, method: &str, params: Value) -> Option<MethodReply> {
+            match method {
+                "resources/list" => Some(MethodReply::success(json!({
+                    "resources": [{
+                        "uri": "test://resource",
+                        "name": "test"
+                    }]
+                }))),
+                "resources/read" => {
+                    if params.get("uri").and_then(Value::as_str) == Some("test://resource") {
+                        Some(MethodReply::success(json!({
+                            "contents": [{
+                                "uri": "test://resource",
+                                "text": "ok"
+                            }]
+                        })))
+                    } else {
+                        Some(MethodReply::error(-32_602, "unknown resource URI"))
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn composes_capabilities_and_extension_methods() {
+        let mut server = Resources;
+        let initialized = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            initialized["result"]["capabilities"]["resources"]["subscribe"],
+            false
+        );
+
+        let listed = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/list"
+            }),
+        )
+        .unwrap();
+        assert_eq!(listed["result"]["resources"][0]["uri"], "test://resource");
+
+        let mut output = Vec::new();
+        assert!(serve_message(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"missing"}}"#,
+            &mut output,
+        )
+        .unwrap());
+        let response: Value = blazingly_json::from_slice(&output).expect("valid JSON response");
+        assert_eq!(response["error"]["code"], -32_602);
     }
 
     #[test]

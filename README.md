@@ -17,10 +17,10 @@ Published stable release:
 
 ```toml
 [dependencies]
-mcport = "0.2.0"
+mcport = "0.3.0"
 ```
 
-Or run `cargo add mcport@0.2.0`.
+Or run `cargo add mcport@0.3.0`.
 
 `mcport` uses `blazingly-json` for its public `Value`, `RawJson`, `RawValue`,
 and `json!` surface. Applications can import those types from `mcport` and do
@@ -46,7 +46,7 @@ relative advantage remained stable.
 A typed builder handler was another 1.31-1.35x faster than the already-fast
 `Value` handler for the measured tool call.
 
-The `0.2.0` work keeps `serve_message` as the canonical fast path. New modern
+The `0.3.0` work keeps `serve_message` as the canonical fast path. New modern
 protocol fallbacks and pagination are placed on cold paths. The black-box
 runner can also compare a current binary against an exact baseline binary in
 alternating pairs and fail on a configured latency regression; see
@@ -389,6 +389,9 @@ keep those values text-only.
 - consumes notifications without replies;
 - returns JSON-RPC errors without terminating the stream;
 - supports opaque cursor pagination for `tools/list`;
+- lets servers compose initialization/discovery capabilities and handle
+  runtime-neutral JSON-RPC extensions such as `resources/list`,
+  `resources/templates/list`, and `resources/read`;
 - reports unknown tools as protocol errors and handler failures as MCP content
   errors with `isError: true`;
 - mirrors object-shaped output into `structuredContent`; scalar and array
@@ -398,11 +401,14 @@ keep those values text-only.
 
 ## Scope
 
-The `0.2.0` runtime remains server-only, stdio-only, and tools-only. It covers
+The `0.3.0` runtime remains server-only and stdio-only. It covers
 bounded framing/output, controlled concurrency, queue backpressure, handler
 deadlines, cooperative cancellation, progress, panic isolation, and tool
-pagination. It does not yet implement resources, prompts, roots, sampling,
-completions, subscriptions, tasks, OAuth, or remote HTTP transports.
+pagination. The core owns the tools protocol and exposes capability composition
+plus a typed `MethodReply` extension hook for resources and other
+runtime-neutral request families. It does not prescribe resource storage or
+implement prompts, roots, sampling, completions, subscriptions, tasks, OAuth,
+or remote HTTP transports.
 
 Those capabilities should grow as runtime-neutral protocol layers with
 separate transport adapters. The blocking stdio default must remain Tokio-free;
@@ -436,7 +442,7 @@ executor.
 The published registry dependency is:
 
 ```toml
-mcport = "0.2.0"
+mcport = "0.3.0"
 ```
 
 For code still importing `serde_json` everywhere, migration can be staged by
@@ -481,8 +487,8 @@ npx -y @modelcontextprotocol/inspector@latest --cli \
 
 ## Release
 
-Published: `mcport 0.2.0` is available from crates.io and can be installed with
-`cargo add mcport@0.2.0`. The `0.1.0` release remains available for applications
+Published: `mcport 0.3.0` is available from crates.io and can be installed with
+`cargo add mcport@0.3.0`. Earlier releases remain available for applications
 that only need the original inline server surface.
 
 ## License

@@ -1,7 +1,7 @@
 use crate::transport::{read_frame, FrameStatus, ResponseBuffer};
 use crate::{
-    FlushPolicy, Map, RawJson, RawValue, ServerIdentity, ToolPage, ToolReply, ToolServer,
-    TransportLimits, Value,
+    FlushPolicy, Map, MethodReply, RawJson, RawValue, ServerIdentity, ToolPage, ToolReply,
+    ToolServer, TransportLimits, Value,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -240,6 +240,16 @@ pub trait ConcurrentToolServer: Send + Sync + 'static {
         None
     }
 
+    /// Server capabilities reported by initialization and discovery.
+    fn capabilities(&self) -> Value {
+        crate::json!({"tools": {"listChanged": false}})
+    }
+
+    /// Borrows stored server capabilities when available.
+    fn capabilities_ref(&self) -> Option<&Value> {
+        None
+    }
+
     /// Returns the complete tool catalog.
     fn catalog(&self) -> Value;
 
@@ -280,6 +290,16 @@ pub trait ConcurrentToolServer: Send + Sync + 'static {
             Ok(arguments) => self.call(context, name, arguments),
             Err(error) => ToolReply::error(format!("invalid arguments for {name}: {error}")),
         }
+    }
+
+    /// Handles a JSON-RPC method outside the built-in MCP tool surface.
+    fn call_method(
+        &self,
+        _context: &RequestContext,
+        _method: &str,
+        _params: Value,
+    ) -> Option<MethodReply> {
+        None
     }
 }
 
@@ -488,6 +508,14 @@ impl<S: ConcurrentToolServer> ToolServer for Adapter<'_, S> {
         self.server.identity_ref()
     }
 
+    fn capabilities(&self) -> Value {
+        self.server.capabilities()
+    }
+
+    fn capabilities_ref(&self) -> Option<&Value> {
+        self.server.capabilities_ref()
+    }
+
     fn catalog(&mut self) -> Value {
         self.server.catalog()
     }
@@ -518,6 +546,10 @@ impl<S: ConcurrentToolServer> ToolServer for Adapter<'_, S> {
 
     fn call_raw(&mut self, name: &str, arguments: RawJson<'_>) -> ToolReply {
         self.server.call_raw(self.context, name, arguments)
+    }
+
+    fn call_method(&mut self, method: &str, params: Value) -> Option<MethodReply> {
+        self.server.call_method(self.context, method, params)
     }
 }
 
