@@ -156,20 +156,9 @@ struct ErrorBody {
 #[serde(rename_all = "camelCase")]
 struct InitializeResult<'a> {
     protocol_version: &'a str,
-    capabilities: Capabilities,
+    capabilities: &'a Value,
     server_info: ServerInfo<'a>,
     instructions: &'a str,
-}
-
-#[derive(Serialize)]
-struct Capabilities {
-    tools: ToolsCapability,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolsCapability {
-    list_changed: bool,
 }
 
 #[derive(Serialize)]
@@ -251,7 +240,7 @@ pub(crate) fn dispatch_line(
         "tools/call" => {
             write_tool_call(server, writer, id, route.name.as_deref(), route.arguments)?;
         }
-        _ => write_error(writer, id, -32_601, format!("method not found: {method}"))?,
+        _ => return dispatch_owned_line(server, line, writer),
     }
     Ok(true)
 }
@@ -386,11 +375,21 @@ fn write_initialize(
     id: RequestId<'_>,
     protocol_version: &str,
 ) -> io::Result<()> {
+    let capabilities = server
+        .capabilities_ref()
+        .cloned()
+        .unwrap_or_else(|| server.capabilities());
     if let Some(identity) = server.identity_ref() {
-        return write_initialize_with_identity(writer, id, protocol_version, identity);
+        return write_initialize_with_identity(
+            writer,
+            id,
+            protocol_version,
+            identity,
+            &capabilities,
+        );
     }
     let identity = server.identity();
-    write_initialize_with_identity(writer, id, protocol_version, &identity)
+    write_initialize_with_identity(writer, id, protocol_version, &identity, &capabilities)
 }
 
 fn write_initialize_with_identity(
@@ -398,6 +397,7 @@ fn write_initialize_with_identity(
     id: RequestId<'_>,
     protocol_version: &str,
     identity: &ServerIdentity,
+    capabilities: &Value,
 ) -> io::Result<()> {
     let protocol_version = negotiate_protocol_version(Some(protocol_version));
     write(
@@ -407,11 +407,7 @@ fn write_initialize_with_identity(
             id,
             result: InitializeResult {
                 protocol_version,
-                capabilities: Capabilities {
-                    tools: ToolsCapability {
-                        list_changed: false,
-                    },
-                },
+                capabilities,
                 server_info: ServerInfo {
                     name: &identity.name,
                     version: &identity.version,
