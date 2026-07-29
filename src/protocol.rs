@@ -18,6 +18,26 @@ pub fn error(id: &Value, code: i64, message: impl Into<String>) -> Value {
     })
 }
 
+/// Adds a JSON-RPC error data object to an error envelope.
+#[must_use]
+pub fn error_with_data(id: &Value, code: i64, message: impl Into<String>, data: Value) -> Value {
+    let mut response = error(id, code, message);
+    if let Some(error) = response.get_mut("error").and_then(Value::as_object_mut) {
+        error.insert("data".to_owned(), data);
+    }
+    response
+}
+
+/// Marks a successful result as complete for MCP 2026-07-28.
+pub(crate) fn mark_complete(response: &mut Value) {
+    if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
+        result.insert(
+            "resultType".to_owned(),
+            Value::String("complete".to_owned()),
+        );
+    }
+}
+
 /// A successful `tools/call` result with text content, and, when
 /// `structured` is set, a `structuredContent` mirror of the same value.
 #[must_use]
@@ -59,6 +79,22 @@ pub fn tool_success_raw(id: &Value, value: &RawValue, structured: bool) -> Value
     success(id, &result)
 }
 
+/// A successful MCP 2026-07-28 result with arbitrary JSON structured content.
+#[must_use]
+pub fn tool_success_raw_any(id: &Value, value: &RawValue) -> Value {
+    let mut result = json!({
+        "content": [{"type": "text", "text": value.get()}],
+        "isError": false
+    });
+    if let (Some(object), Ok(value)) = (
+        result.as_object_mut(),
+        blazingly_json::from_str::<Value>(value.get()),
+    ) {
+        object.insert("structuredContent".to_owned(), value);
+    }
+    success(id, &result)
+}
+
 /// A failed `tools/call` result. Tool failures are content-level errors, not
 /// JSON-RPC protocol errors, so agents can read and react to them.
 #[must_use]
@@ -91,6 +127,10 @@ mod tests {
 
         let scalar = super::tool_success(&json!(3), &json!(5), true);
         assert!(scalar["result"].get("structuredContent").is_none());
+
+        let raw_scalar = blazingly_json::to_raw_value(&5).unwrap();
+        let modern_scalar = super::tool_success_raw_any(&json!(3), &raw_scalar);
+        assert_eq!(modern_scalar["result"]["structuredContent"], 5);
 
         let failed = super::tool_error(&json!(4), "boom");
         assert_eq!(failed["result"]["isError"], true);

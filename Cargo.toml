@@ -1,9 +1,9 @@
 [package]
 name = "mcport"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Fast, Tokio-free MCP stdio server runtime with typed tools"
+description = "Fast, bounded, Tokio-free MCP stdio runtime with controlled tools"
 license = "MIT"
 authors = ["Sergii Ziborov <sergii.ziborov@gmail.com>"]
 homepage = "https://weavatrix.com"
@@ -18,9 +18,20 @@ categories = ["development-tools", "network-programming"]
 blazingly-json = "0.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 
+[features]
+subprocess-tests = []
+
 [[bench]]
 name = "runtime"
 harness = false
+
+[[bin]]
+name = "mcport-test-server"
+path = "tests/support/stdio_server.rs"
+required-features = ["subprocess-tests"]
+test = false
+bench = false
+doc = false
 
 [lints.rust]
 unsafe_code = "forbid"

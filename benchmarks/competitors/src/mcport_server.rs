@@ -9,7 +9,7 @@ struct QueryArguments {
 }
 
 fn main() -> std::io::Result<()> {
-    McpServer::new("mcport-bench", "0.1.0")
+    McpServer::new("mcport-bench", "0.2.0")
         .typed_tool(
             "query_graph",
             "Queries the graph.",

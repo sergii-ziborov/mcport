@@ -117,6 +117,11 @@ fn median(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
+fn median_ratio(samples: &mut [f64]) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
 fn validate_response(workload: &str, response: &[u8]) {
     let response: serde_json::Value =
         serde_json::from_slice(response).expect("last response is valid JSON");
@@ -144,32 +149,57 @@ fn validate_response(workload: &str, response: &[u8]) {
 
 fn compare(directory: &Path, workload: &str, message_tail: &str) {
     let input = input_for(message_tail);
-    let servers = ["mcport-server", "rmcp-server", "rust-mcp-sdk-server"];
-    let mut samples: [Vec<Duration>; 3] = std::array::from_fn(|_| Vec::with_capacity(ROUNDS));
-    let mut response_bytes = [0; 3];
+    let baseline = std::env::var_os("MCPORT_BASELINE_SERVER");
+    let mut servers = vec![(
+        "mcport-server".to_owned(),
+        executable(directory, "mcport-server"),
+    )];
+    if let Some(baseline) = &baseline {
+        servers.push(("mcport-baseline".to_owned(), PathBuf::from(baseline)));
+    }
+    if baseline.is_none() || std::env::var_os("MCPORT_BASELINE_ONLY").is_none() {
+        servers.extend([
+            (
+                "rmcp-server".to_owned(),
+                executable(directory, "rmcp-server"),
+            ),
+            (
+                "rust-mcp-sdk-server".to_owned(),
+                executable(directory, "rust-mcp-sdk-server"),
+            ),
+        ]);
+    }
+    let rounds = if baseline.is_some() { 9 } else { ROUNDS };
+    let mut samples = vec![Vec::with_capacity(rounds); servers.len()];
+    let mut paired_ratios = Vec::with_capacity(rounds);
+    let mut response_bytes = vec![0; servers.len()];
     println!("\n{workload} ({ITERATIONS} requests after initialization)");
 
-    for (index, server) in servers.iter().enumerate() {
-        let path = executable(directory, server);
-        let (_, responses, bytes, last_response) = run_once(&path, &input);
+    for (index, (_, path)) in servers.iter().enumerate() {
+        let (_, responses, bytes, last_response) = run_once(path, &input);
         assert_eq!(responses, ITERATIONS + 1);
         response_bytes[index] = bytes;
         validate_response(workload, &last_response);
     }
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
+        let mut elapsed_by_server = vec![Duration::ZERO; servers.len()];
         for offset in 0..servers.len() {
             let index = (round + offset) % servers.len();
-            let path = executable(directory, servers[index]);
-            let (elapsed, responses, bytes, _) = run_once(&path, &input);
+            let (elapsed, responses, bytes, _) = run_once(&servers[index].1, &input);
             assert_eq!(responses, ITERATIONS + 1);
             assert_eq!(bytes, response_bytes[index]);
             samples[index].push(elapsed);
+            elapsed_by_server[index] = elapsed;
+        }
+        if baseline.is_some() {
+            paired_ratios
+                .push(elapsed_by_server[0].as_secs_f64() / elapsed_by_server[1].as_secs_f64());
         }
     }
 
-    let medians = samples.each_mut().map(|sample| median(sample));
+    let medians: Vec<_> = samples.iter_mut().map(|sample| median(sample)).collect();
     let baseline = medians[0].as_secs_f64();
-    for (index, server) in servers.iter().enumerate() {
+    for (index, (server, _)) in servers.iter().enumerate() {
         let elapsed = medians[index];
         let per_request = elapsed.as_secs_f64() * 1e9 / ITERATIONS as f64;
         let throughput = ITERATIONS as f64 / elapsed.as_secs_f64();
@@ -179,6 +209,23 @@ fn compare(directory: &Path, workload: &str, message_tail: &str) {
             "{server:<24} {per_request:>10.2} ns/request {throughput:>10.0} req/s \
              {bytes_per_response:>7.1} B/response {relative:>6.2}x"
         );
+    }
+    if servers
+        .get(1)
+        .is_some_and(|(name, _)| name == "mcport-baseline")
+    {
+        let ratio = median_ratio(&mut paired_ratios);
+        let delta_percent = (ratio - 1.0) * 100.0;
+        println!("paired current vs baseline: {delta_percent:+.2}% latency");
+        if let Ok(max_regression) = std::env::var("MCPORT_MAX_REGRESSION_PERCENT") {
+            let max_regression = max_regression
+                .parse::<f64>()
+                .expect("MCPORT_MAX_REGRESSION_PERCENT must be a number");
+            assert!(
+                delta_percent <= max_regression,
+                "{workload} regressed by {delta_percent:.2}% (limit {max_regression:.2}%)"
+            );
+        }
     }
 }
 

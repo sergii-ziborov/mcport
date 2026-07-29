@@ -2,9 +2,10 @@
 //!
 //! MCP over stdio is a single ordered byte stream: the client writes one
 //! newline-delimited JSON-RPC message, the server answers on stdout. There is
-//! no multiplexing to schedule, so this crate deliberately ships no async
-//! executor. The entire runtime is a blocking read loop over `std::io`, and
-//! its protocol path uses `blazingly-json` without Tokio, Hyper, or Axum.
+//! no need for an async executor: the inline adapter is a blocking bounded
+//! read loop, while the optional controlled adapter uses fixed standard-library
+//! worker threads and one ordered writer. The protocol path uses
+//! `blazingly-json` without Tokio, Hyper, or Axum.
 //!
 //! Small servers can register tools directly:
 //!
@@ -65,23 +66,38 @@
 //!   Windows shell pipelines cannot break the first request;
 //! - notifications (messages without an `id`) are consumed without replies;
 //! - malformed JSON, missing methods, and unknown methods produce JSON-RPC
-//!   errors without terminating the loop.
+//!   errors without terminating the loop;
+//! - stream adapters bound request and response bytes and never emit a partial
+//!   JSON response when the output budget is exceeded.
 
 mod builder;
+mod controlled;
 mod fast;
 pub mod protocol;
+mod transport;
 
 pub use blazingly_json::{json, Map, RawJson, RawValue, Value};
 pub use builder::McpServer;
+pub use controlled::{
+    serve_controlled, serve_controlled_streams, CancellationToken, ConcurrentMcpServer,
+    ConcurrentToolServer, RequestContext, RuntimeConfig,
+};
+pub use transport::{FlushPolicy, TransportConfig, TransportLimits};
 
 use serde::Serialize;
 use std::io::{self, BufRead, Write};
 
-/// Latest stable protocol revision implemented by the runtime.
+/// Latest legacy handshake revision implemented by the runtime.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 
-/// Stable protocol revisions accepted by this runtime.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+/// Stateless per-request protocol revision implemented by the runtime.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Protocol revisions accepted by this runtime.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &[MODERN_PROTOCOL_VERSION, "2025-11-25", "2025-06-18"];
+
+const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 
 /// Chooses a supported protocol revision for an initialize response.
 ///
@@ -91,7 +107,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     requested
         .and_then(|requested| {
-            SUPPORTED_PROTOCOL_VERSIONS
+            SUPPORTED_LEGACY_PROTOCOL_VERSIONS
                 .iter()
                 .copied()
                 .find(|supported| *supported == requested)
@@ -142,6 +158,13 @@ pub enum ToolReply {
         /// Whether to also attach the object as `structuredContent`.
         structured: bool,
     },
+    /// Pre-serialized non-object structured output for MCP 2026-07-28.
+    ///
+    /// Legacy revisions still expose this value through text content only.
+    StructuredAny {
+        /// One complete validated JSON scalar or array.
+        value: Box<RawValue>,
+    },
     /// Tool failure reported as `isError: true` content, not a protocol error.
     Error(String),
 }
@@ -166,16 +189,16 @@ impl ToolReply {
 
     /// Serializes a successful tool result once.
     ///
-    /// `structured` is honored only for object-shaped JSON because MCP
-    /// requires `structuredContent` to have an object root. Other values still
-    /// succeed as text content.
+    /// Object-shaped output is structured in every supported revision.
+    /// Arrays and scalars are structured in MCP 2026-07-28 and remain
+    /// text-only when serving a legacy revision.
     #[must_use]
     pub fn success(value: impl Serialize, structured: bool) -> Self {
         match blazingly_json::to_raw_value(&value) {
-            Ok(value) => Self::Serialized {
-                structured: structured && value.get().starts_with('{'),
-                value,
-            },
+            Ok(value) if structured && !value.get().starts_with('{') => {
+                Self::StructuredAny { value }
+            }
+            Ok(value) => Self::Serialized { structured, value },
             Err(error) => Self::Error(format!("tool result serialization failed: {error}")),
         }
     }
@@ -184,6 +207,26 @@ impl ToolReply {
     #[must_use]
     pub fn error(message: impl Into<String>) -> Self {
         Self::Error(message.into())
+    }
+}
+
+/// One cursor-addressed page returned from `tools/list`.
+#[derive(Debug, Clone)]
+pub struct ToolPage {
+    /// Tool descriptors in this page.
+    pub tools: Value,
+    /// Opaque cursor for the next page.
+    pub next_cursor: Option<String>,
+}
+
+impl ToolPage {
+    /// Creates a complete, non-paginated tool list.
+    #[must_use]
+    pub const fn complete(tools: Value) -> Self {
+        Self {
+            tools,
+            next_cursor: None,
+        }
     }
 }
 
@@ -220,6 +263,19 @@ pub trait ToolServer {
         None
     }
 
+    /// Reports whether `tools/list` should use [`ToolServer::catalog_page`].
+    fn catalog_is_paginated(&self) -> bool {
+        false
+    }
+
+    /// Returns one cursor-addressed tool page.
+    fn catalog_page(&mut self, cursor: Option<&str>) -> Result<ToolPage, String> {
+        if cursor.is_some() {
+            return Err("invalid tools/list cursor".to_owned());
+        }
+        Ok(ToolPage::complete(self.catalog()))
+    }
+
     /// Reports whether a tool name is registered when the server can know
     /// without invoking it.
     ///
@@ -253,9 +309,40 @@ pub trait ToolServer {
 /// Returns only stdio failures. Invalid requests are answered with JSON-RPC
 /// errors and do not terminate the server.
 pub fn serve(server: &mut impl ToolServer) -> io::Result<()> {
+    serve_with_limits(server, TransportLimits::default())
+}
+
+/// Serves a [`ToolServer`] over process stdin/stdout with explicit byte budgets.
+///
+/// # Errors
+///
+/// Returns stream failures or an invalid limits configuration.
+pub fn serve_with_limits(server: &mut impl ToolServer, limits: TransportLimits) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    serve_streams(server, stdin.lock(), stdout.lock())
+    serve_streams_with_limits(server, stdin.lock(), stdout.lock(), limits)
+}
+
+/// Serves a [`ToolServer`] over process stdin/stdout with complete transport
+/// policy, including opt-in response batching.
+///
+/// # Errors
+///
+/// Returns stream failures or an invalid transport configuration.
+pub fn serve_with_config(server: &mut impl ToolServer, config: TransportConfig) -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    match config.flush_policy {
+        FlushPolicy::PerMessage => {
+            serve_streams_with_config(server, stdin.lock(), stdout.lock(), config)
+        }
+        FlushPolicy::Batch { .. } => serve_streams_with_config(
+            server,
+            stdin.lock(),
+            io::BufWriter::new(stdout.lock()),
+            config,
+        ),
+    }
 }
 
 /// Serves a [`ToolServer`] over arbitrary streams until EOF.
@@ -268,24 +355,42 @@ pub fn serve(server: &mut impl ToolServer) -> io::Result<()> {
 /// Returns only stream I/O failures.
 pub fn serve_streams(
     server: &mut impl ToolServer,
-    mut reader: impl BufRead,
-    mut writer: impl Write,
+    reader: impl BufRead,
+    writer: impl Write,
 ) -> io::Result<()> {
-    let mut line = String::with_capacity(512);
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
-            }
-        }
-        serve_message(server, &line, &mut writer)?;
-    }
-    Ok(())
+    serve_streams_with_limits(server, reader, writer, TransportLimits::default())
+}
+
+/// Serves a [`ToolServer`] over arbitrary streams with explicit byte budgets.
+///
+/// Responses are assembled in a reusable bounded buffer before they become
+/// visible on the output stream, so a response budget failure never emits a
+/// truncated JSON document.
+///
+/// # Errors
+///
+/// Returns stream failures or an invalid limits configuration.
+pub fn serve_streams_with_limits(
+    server: &mut impl ToolServer,
+    reader: impl BufRead,
+    writer: impl Write,
+    limits: TransportLimits,
+) -> io::Result<()> {
+    transport::serve_streams_bounded(server, reader, writer, limits)
+}
+
+/// Serves a [`ToolServer`] over arbitrary streams with byte and flush policy.
+///
+/// # Errors
+///
+/// Returns stream failures or an invalid transport configuration.
+pub fn serve_streams_with_config(
+    server: &mut impl ToolServer,
+    reader: impl BufRead,
+    writer: impl Write,
+    config: TransportConfig,
+) -> io::Result<()> {
+    transport::serve_streams_configured(server, reader, writer, config)
 }
 
 /// Processes one newline-free JSON-RPC message.
@@ -336,60 +441,154 @@ pub fn dispatch(server: &mut impl ToolServer, request: &Value) -> Option<Value> 
             "missing JSON-RPC method",
         ));
     };
+    let modern = match request_uses_modern_protocol(request, id.as_ref().unwrap_or(&Value::Null)) {
+        Ok(modern) => modern,
+        Err(response) => return Some(response),
+    };
     let id = id?;
     Some(match method {
-        "initialize" => {
-            let requested_version = request
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str);
-            let version = negotiate_protocol_version(requested_version);
-            let identity = server.identity();
-            protocol::success(
-                &id,
-                &json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {
-                        "name": identity.name,
-                        "version": identity.version
-                    },
-                    "instructions": identity.instructions
-                }),
-            )
-        }
+        "initialize" => initialize_response(server, request, &id),
+        "server/discover" if modern => discover_response(server, &id),
+        "ping" if modern => protocol::error(&id, -32_601, "method not found: ping"),
         "ping" => protocol::success(&id, &json!({})),
-        "tools/list" => protocol::success(&id, &json!({"tools": server.catalog()})),
-        "tools/call" => {
-            let Some(name) = request.pointer("/params/name").and_then(Value::as_str) else {
-                return Some(protocol::error(
-                    &id,
-                    -32_602,
-                    "tools/call requires params.name",
-                ));
-            };
-            if server.has_tool(name) == Some(false) {
-                return Some(protocol::error(
-                    &id,
-                    -32_602,
-                    format!("unknown tool: {name}"),
-                ));
-            }
-            let arguments = request
-                .pointer("/params/arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            match server.call(name, arguments) {
-                ToolReply::Success { value, structured } => {
-                    protocol::tool_success(&id, &value, structured)
-                }
-                ToolReply::Serialized { value, structured } => {
-                    protocol::tool_success_raw(&id, &value, structured)
-                }
-                ToolReply::Error(message) => protocol::tool_error(&id, message),
-            }
-        }
+        "tools/list" => tools_list_response(server, request, &id, modern),
+        "tools/call" => tool_call_response(server, request, &id, modern),
         _ => protocol::error(&id, -32_601, format!("method not found: {method}")),
     })
+}
+
+fn request_uses_modern_protocol(request: &Value, id: &Value) -> Result<bool, Value> {
+    let requested_version = request
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str);
+    let Some(requested_version) = requested_version else {
+        return Ok(false);
+    };
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&requested_version) {
+        return Err(protocol::error_with_data(
+            id,
+            -32_022,
+            "Unsupported protocol version",
+            json!({
+                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                "requested": requested_version
+            }),
+        ));
+    }
+    if requested_version != MODERN_PROTOCOL_VERSION {
+        return Err(protocol::error(
+            id,
+            -32_600,
+            "legacy protocol versions require the initialize lifecycle",
+        ));
+    }
+    if request
+        .pointer("/params/_meta/io.modelcontextprotocol~1clientCapabilities")
+        .is_none()
+    {
+        return Err(protocol::error(
+            id,
+            -32_602,
+            "missing io.modelcontextprotocol/clientCapabilities",
+        ));
+    }
+    Ok(true)
+}
+
+fn initialize_response(server: &impl ToolServer, request: &Value, id: &Value) -> Value {
+    let requested_version = request
+        .pointer("/params/protocolVersion")
+        .and_then(Value::as_str);
+    let version = negotiate_protocol_version(requested_version);
+    let identity = server.identity();
+    protocol::success(
+        id,
+        &json!({
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": false}},
+            "serverInfo": {
+                "name": identity.name,
+                "version": identity.version
+            },
+            "instructions": identity.instructions
+        }),
+    )
+}
+
+fn discover_response(server: &impl ToolServer, id: &Value) -> Value {
+    let identity = server.identity();
+    protocol::success(
+        id,
+        &json!({
+            "resultType": "complete",
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": {"tools": {"listChanged": false}},
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": identity.name,
+                    "version": identity.version
+                }
+            },
+            "instructions": identity.instructions
+        }),
+    )
+}
+
+fn tool_call_response(
+    server: &mut impl ToolServer,
+    request: &Value,
+    id: &Value,
+    modern: bool,
+) -> Value {
+    let Some(name) = request.pointer("/params/name").and_then(Value::as_str) else {
+        return protocol::error(id, -32_602, "tools/call requires params.name");
+    };
+    if server.has_tool(name) == Some(false) {
+        return protocol::error(id, -32_602, format!("unknown tool: {name}"));
+    }
+    let arguments = request
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut response = match server.call(name, arguments) {
+        ToolReply::Success { value, structured } => protocol::tool_success(id, &value, structured),
+        ToolReply::Serialized { value, structured } => {
+            protocol::tool_success_raw(id, &value, structured)
+        }
+        ToolReply::StructuredAny { value } if modern => protocol::tool_success_raw_any(id, &value),
+        ToolReply::StructuredAny { value } => protocol::tool_success_raw(id, &value, false),
+        ToolReply::Error(message) => protocol::tool_error(id, message),
+    };
+    if modern {
+        protocol::mark_complete(&mut response);
+    }
+    response
+}
+
+fn tools_list_response(
+    server: &mut impl ToolServer,
+    request: &Value,
+    id: &Value,
+    modern: bool,
+) -> Value {
+    let cursor = request.pointer("/params/cursor").and_then(Value::as_str);
+    let page = if server.catalog_is_paginated() || cursor.is_some() {
+        match server.catalog_page(cursor) {
+            Ok(page) => page,
+            Err(message) => return protocol::error(id, -32_602, message),
+        }
+    } else {
+        ToolPage::complete(server.catalog())
+    };
+    let mut result = json!({"tools": page.tools});
+    if let (Some(result), Some(next_cursor)) = (result.as_object_mut(), page.next_cursor) {
+        result.insert("nextCursor".to_owned(), Value::String(next_cursor));
+    }
+    let mut response = protocol::success(id, &result);
+    if modern {
+        protocol::mark_complete(&mut response);
+    }
+    response
 }
 
 #[cfg(test)]
@@ -420,6 +619,7 @@ mod tests {
             match name {
                 "echo" => ToolReply::structured(arguments),
                 "flat" => ToolReply::text(arguments),
+                "scalar" => ToolReply::structured(5),
                 _ => ToolReply::error(format!("unknown tool: {name}")),
             }
         }
@@ -552,6 +752,96 @@ mod tests {
             dispatch(&mut server, &json!({"jsonrpc": "1.0", "method": "ping"})).unwrap();
         assert_eq!(malformed_notification["id"], Value::Null);
         assert_eq!(malformed_notification["error"]["code"], -32_600);
+    }
+
+    #[test]
+    fn supports_modern_discovery_and_versioned_tool_results() {
+        let modern_meta = json!({
+            "io.modelcontextprotocol/protocolVersion": super::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let mut server = Echo { calls: 0 };
+        let discovered = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "discover",
+                "method": "server/discover",
+                "params": {"_meta": modern_meta.clone()}
+            }),
+        )
+        .unwrap();
+        assert_eq!(discovered["result"]["resultType"], "complete");
+        assert_eq!(
+            discovered["result"]["supportedVersions"][0],
+            super::MODERN_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "echo"
+        );
+
+        let listed = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {"_meta": modern_meta.clone()}
+            }),
+        )
+        .unwrap();
+        assert_eq!(listed["result"]["resultType"], "complete");
+
+        let called = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "_meta": modern_meta.clone(),
+                    "name": "echo",
+                    "arguments": {"modern": true}
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(called["result"]["resultType"], "complete");
+        assert_eq!(called["result"]["structuredContent"]["modern"], true);
+
+        let scalar = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "scalar",
+                "method": "tools/call",
+                "params": {
+                    "_meta": modern_meta,
+                    "name": "scalar",
+                    "arguments": {}
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(scalar["result"]["structuredContent"], 5);
+
+        let unsupported = dispatch(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": {"_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "1900-01-01",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }}
+            }),
+        )
+        .unwrap();
+        assert_eq!(unsupported["error"]["code"], -32_022);
+        assert_eq!(unsupported["error"]["data"]["requested"], "1900-01-01");
     }
 
     #[test]

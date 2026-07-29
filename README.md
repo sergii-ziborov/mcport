@@ -1,21 +1,26 @@
 # mcport
 
-Fast, blocking, Tokio-free MCP stdio for Rust.
+Fast, bounded, Tokio-free MCP stdio for Rust.
 
 `mcport` is a small server runtime for applications that need MCP tools without
 bringing an async executor into the process. It combines a compact builder API,
 typed and raw tool handlers, a lower-level trait, zero-copy request routing,
-canonical control-message recognition, and direct response serialization.
+canonical control-message recognition, direct response serialization, and an
+optional controlled scheduler for expensive handlers.
 
 The `mcport` crate contains no Tokio, Hyper, Axum, futures executor, or unsafe
 code.
 
 ## Install
 
+Published stable release:
+
 ```toml
 [dependencies]
-mcport = "0.1.0"
+mcport = "0.2.0"
 ```
+
+Or run `cargo add mcport@0.2.0`.
 
 `mcport` uses `blazingly-json` for its public `Value`, `RawJson`, `RawValue`,
 and `json!` surface. Applications can import those types from `mcport` and do
@@ -23,7 +28,8 @@ not need a second direct JSON dependency for MCP handling.
 
 ## Performance
 
-Local Windows measurements on an Intel Core Ultra 7 255U. These are ranges
+The table below records the published `0.1.0` baseline on an Intel Core Ultra 7
+255U running Windows. These are ranges
 across three complete release-profile runs; each run alternates implementation
 order for 24 rounds and reports the median. Both paths use the same
 `blazingly-json` engine, so the difference measures runtime architecture rather
@@ -37,13 +43,19 @@ relative advantage remained stable.
 | tools/list | 2,128.22-2,736.24 ns | 7,877.45-9,916.41 ns | 3.62-3.78x |
 | tools/call | 2,150.33-2,332.38 ns | 8,409.90-8,739.66 ns | 3.66-3.97x |
 
-A typed builder handler is another 1.31-1.35x faster than the already-fast
+A typed builder handler was another 1.31-1.35x faster than the already-fast
 `Value` handler for the measured tool call.
+
+The `0.2.0` work keeps `serve_message` as the canonical fast path. New modern
+protocol fallbacks and pagination are placed on cold paths. The black-box
+runner can also compare a current binary against an exact baseline binary in
+alternating pairs and fail on a configured latency regression; see
+`benchmarks/competitors/README.md`.
 
 ### Full-process competitor benchmark
 
 The committed black-box harness also compares complete release binaries over
-real stdin/stdout pipes. It uses `mcport 0.1.0`, the official Rust SDK
+real stdin/stdout pipes. The archived table uses `mcport 0.1.0`, the official Rust SDK
 `rmcp 0.16.0`, and `rust-mcp-sdk 1.0.1`. Each server receives an initialize
 handshake followed by 10,000 uniquely identified requests. Every complete run
 warms each binary once, rotates server order across five measured rounds, and
@@ -163,6 +175,66 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+`McpServer` is the smallest mode: one request is dispatched inline at a time.
+Its stdio adapter still enforces bounded input and atomic bounded output, with
+8 MiB request and response defaults. Use `serve_with_limits` to choose lower
+budgets. Oversized input is drained through the next newline; oversized output
+is replaced by one valid JSON-RPC error rather than truncated bytes.
+`FlushPolicy::PerMessage` is the interactive default. Throughput-oriented
+adapters may opt into `FlushPolicy::Batch { max_messages }` through
+`TransportConfig` and `serve_with_config`; a partial final batch is always
+flushed at EOF. Batching deliberately trades response latency for fewer flush
+boundaries.
+
+## Controlled runtime
+
+Use `ConcurrentMcpServer` when tools can be slow, parallel, cancellable, or
+untrusted enough to require scheduling policy:
+
+```rust
+use mcport::{
+    json, ConcurrentMcpServer, FlushPolicy, RuntimeConfig, ToolReply,
+    TransportLimits,
+};
+use std::time::Duration;
+
+fn main() -> std::io::Result<()> {
+    let config = RuntimeConfig {
+        transport: TransportLimits::new(1024 * 1024, 1024 * 1024),
+        max_in_flight: 4,
+        queue_depth: 32,
+        output_queue_depth: 32,
+        output_flush_policy: FlushPolicy::PerMessage,
+        handler_deadline: Some(Duration::from_secs(10)),
+    };
+
+    ConcurrentMcpServer::new("worker", "1.0.0")
+        .tool(
+            "work",
+            "Runs bounded cooperative work.",
+            json!({"type": "object"}),
+            |context, arguments| {
+                if context.is_cancelled() {
+                    return ToolReply::error("cancelled");
+                }
+                let _ = context.report_progress(1.0, Some(1.0), Some("done"));
+                ToolReply::structured(arguments)
+            },
+        )
+        .serve(config)
+}
+```
+
+This mode provides a fixed handler-slot ceiling, bounded request and output
+queues, deadlines, per-request cancellation tokens, panic-to-protocol-error
+isolation, and a bounded progress channel. Client cancellation is cooperative:
+handlers must observe `RequestContext::is_cancelled` or its token. A handler
+that ignores cancellation cannot be forcibly killed safely by a Rust thread;
+its slot remains occupied until it exits, preventing detached runaway work
+from creating unbounded concurrency. Hard termination belongs in a separate
+process or another isolation boundary. Panic isolation applies when the binary
+uses unwinding; `panic = "abort"` still terminates the process.
+
 ## Typed tool
 
 Typed handlers deserialize their arguments directly from validated raw JSON.
@@ -262,16 +334,22 @@ impl ToolServer for Echo {
 }
 ```
 
-`ToolServer::call_raw`, `identity_ref`, `catalog_ref`, and `catalog_raw_ref`
-have compatible defaults. Existing implementations do not need to define
-them; optimized implementations can override them.
+`ToolServer::call_raw`, identity/catalog borrowing, and pagination methods have
+compatible defaults. Existing implementations do not need to define them;
+optimized implementations can override them. Both builders expose
+`tool_page_size` for opaque cursor pagination.
 
 ## Embedding
 
-- `serve(&mut server)` owns the standard blocking stdin/stdout loop;
-- `serve_streams` accepts injectable `BufRead`/`Write` streams;
+- `serve(&mut server)` owns the bounded blocking stdin/stdout loop;
+- `serve_with_limits` sets explicit request and response byte budgets;
+- `serve_with_config` additionally selects per-message or batched flushing;
+- `serve_streams` and `serve_streams_with_limits` accept injectable streams;
 - `serve_message` processes one newline-free message and reports whether it
-  wrote a response;
+  wrote a response; framing and byte budgets remain the embedding transport's
+  responsibility;
+- `serve_controlled` and `serve_controlled_streams` run a thread-safe
+  `ConcurrentToolServer` under `RuntimeConfig`;
 - `dispatch` retains the owned `Value` API for compatibility and testing.
 
 ## Protocol contract
@@ -285,6 +363,8 @@ them; optimized implementations can override them.
 | unsupported method | `-32601` method not found |
 | missing/unknown tool | `-32602` invalid params |
 | registered handler failure | successful JSON-RPC envelope with MCP `isError: true` |
+| request over `max_request_bytes` | bounded `-32000` error; frame is drained |
+| response over `max_response_bytes` | atomic `-32000` error, never partial JSON |
 
 The fast recognizers accept only complete canonical layouts. They do not
 partially trust lookalike input: reordered fields, whitespace variants, escaped
@@ -294,17 +374,21 @@ the same JSON-RPC semantics as `dispatch`.
 
 `ToolReply::structured` accepts any `serde::Serialize` result. It serializes
 once into a validated `RawValue`. Object roots are emitted both as compact text
-and zero-copy `structuredContent`. Arrays, scalars, and null remain text-only
-because the MCP schema requires `structuredContent` to be an object.
+and zero-copy `structuredContent` in every supported revision. MCP 2026-07-28
+also permits arrays, scalars, and null as `structuredContent`; legacy responses
+keep those values text-only.
 
 ## Runtime behavior
 
-- supports `initialize`, `ping`, `tools/list`, and `tools/call`;
-- negotiates the current stable MCP revision `2025-11-25` and the legacy
-  `2025-06-18` revision;
+- supports legacy `initialize`, `ping`, `tools/list`, and `tools/call`;
+- supports stateless MCP `2026-07-28` `server/discover` and per-request protocol
+  metadata while retaining `2025-11-25` and `2025-06-18` compatibility;
 - strips UTF-8 BOMs from Windows-oriented input;
+- rejects invalid UTF-8, incomplete EOF frames, and oversized lines without
+  unbounded line allocation;
 - consumes notifications without replies;
 - returns JSON-RPC errors without terminating the stream;
+- supports opaque cursor pagination for `tools/list`;
 - reports unknown tools as protocol errors and handler failures as MCP content
   errors with `isError: true`;
 - mirrors object-shaped output into `structuredContent`; scalar and array
@@ -314,10 +398,11 @@ because the MCP schema requires `structuredContent` to be an object.
 
 ## Scope
 
-The 0.1 runtime is deliberately server-only, stdio-only, and tools-only. It
-does not yet implement resources, prompts, roots, sampling, completions,
-subscriptions, tasks, progress, cancellation, OAuth, or remote HTTP
-transports.
+The `0.2.0` runtime remains server-only, stdio-only, and tools-only. It covers
+bounded framing/output, controlled concurrency, queue backpressure, handler
+deadlines, cooperative cancellation, progress, panic isolation, and tool
+pagination. It does not yet implement resources, prompts, roots, sampling,
+completions, subscriptions, tasks, OAuth, or remote HTTP transports.
 
 Those capabilities should grow as runtime-neutral protocol layers with
 separate transport adapters. The blocking stdio default must remain Tokio-free;
@@ -348,14 +433,10 @@ executor.
 
 ## Migrating an existing MCP server
 
-Replace the local path once the registry crate is available:
+The published registry dependency is:
 
 ```toml
-# before
-mcport = { version = "0.1.0", path = "../mcport" }
-
-# registry
-mcport = "0.1.0"
+mcport = "0.2.0"
 ```
 
 For code still importing `serde_json` everywhere, migration can be staged by
@@ -376,20 +457,33 @@ consumer repository.
 ```text
 cargo fmt --all -- --check
 cargo test --locked
-cargo clippy --all-targets -- -D warnings
+cargo test --locked --features subprocess-tests --test stdio_subprocess
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo +1.78 build --locked
 cargo bench --bench runtime
 cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
 benchmarks/competitors/target/release/bench-runner
 ```
 
-CI covers Linux, Windows, macOS, and Rust 1.78.
+The feature-gated subprocess suite exercises real pipes, fragmented input,
+partial EOF, invalid UTF-8, oversized frames, slow readers, cancellation,
+progress, panic isolation, response overflow, and repeated sessions. CI runs
+it on Linux, Windows, and macOS in addition to the Rust 1.78 build.
+
+An Inspector smoke test can target the fixture without adding Inspector to the
+runtime dependency graph:
+
+```text
+cargo build --features subprocess-tests --bin mcport-test-server
+npx -y @modelcontextprotocol/inspector@latest --cli \
+  target/debug/mcport-test-server --method tools/list
+```
 
 ## Release
 
-Version `0.1.0` is the first public release. It resolves `blazingly-json`
-through crates.io, and the publish workflow repeats `cargo publish --dry-run`
-before uploading the immutable crate.
+Published: `mcport 0.2.0` is available from crates.io and can be installed with
+`cargo add mcport@0.2.0`. The `0.1.0` release remains available for applications
+that only need the original inline server surface.
 
 ## License
 
