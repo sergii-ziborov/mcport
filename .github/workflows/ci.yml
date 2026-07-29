@@ -22,6 +22,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Stdio subprocess conformance
+        run: cargo test --locked --features subprocess-tests --test stdio_subprocess
   msrv:
     runs-on: ubuntu-latest
     steps:

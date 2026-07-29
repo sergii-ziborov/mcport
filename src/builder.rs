@@ -1,4 +1,7 @@
-use crate::{serve, serve_streams, ServerIdentity, ToolReply, ToolServer};
+use crate::{
+    serve, serve_streams, serve_streams_with_config, serve_streams_with_limits, serve_with_config,
+    serve_with_limits, ServerIdentity, ToolReply, ToolServer, TransportConfig, TransportLimits,
+};
 use blazingly_json::{from_str, Map, RawJson, RawValue, Value};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -19,6 +22,7 @@ pub struct McpServer<S = ()> {
     state: S,
     catalog: Value,
     catalog_raw: Option<Box<RawValue>>,
+    tool_page_size: Option<usize>,
     tools: HashMap<String, Handler<S>>,
 }
 
@@ -97,6 +101,7 @@ impl<S> McpServer<S> {
             state,
             catalog: Value::Array(Vec::new()),
             catalog_raw: None,
+            tool_page_size: None,
             tools: HashMap::new(),
         }
     }
@@ -105,6 +110,13 @@ impl<S> McpServer<S> {
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.identity.instructions = instructions.into();
+        self
+    }
+
+    /// Enables cursor pagination for `tools/list`.
+    #[must_use]
+    pub fn tool_page_size(mut self, page_size: usize) -> Self {
+        self.tool_page_size = Some(page_size.max(1));
         self
     }
 
@@ -183,6 +195,24 @@ impl<S> McpServer<S> {
         serve(self)
     }
 
+    /// Runs the server with explicit request and response byte budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns stdio failures or an invalid limits configuration.
+    pub fn serve_with_limits(&mut self, limits: TransportLimits) -> io::Result<()> {
+        serve_with_limits(self, limits)
+    }
+
+    /// Runs the server with complete byte and flush policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport or configuration failures.
+    pub fn serve_with_config(&mut self, config: TransportConfig) -> io::Result<()> {
+        serve_with_config(self, config)
+    }
+
     /// Runs the server over injectable streams until EOF.
     ///
     /// # Errors
@@ -190,6 +220,34 @@ impl<S> McpServer<S> {
     /// Returns only stream failures.
     pub fn serve_streams(&mut self, reader: impl BufRead, writer: impl Write) -> io::Result<()> {
         serve_streams(self, reader, writer)
+    }
+
+    /// Runs the server over injectable streams with explicit byte budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns stream failures or an invalid limits configuration.
+    pub fn serve_streams_with_limits(
+        &mut self,
+        reader: impl BufRead,
+        writer: impl Write,
+        limits: TransportLimits,
+    ) -> io::Result<()> {
+        serve_streams_with_limits(self, reader, writer, limits)
+    }
+
+    /// Runs the server over injectable streams with complete transport policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport or configuration failures.
+    pub fn serve_streams_with_config(
+        &mut self,
+        reader: impl BufRead,
+        writer: impl Write,
+        config: TransportConfig,
+    ) -> io::Result<()> {
+        serve_streams_with_config(self, reader, writer, config)
     }
 
     fn register_descriptor(&mut self, name: &str, description: String, input_schema: Value) {
@@ -261,6 +319,14 @@ impl<S> ToolServer for McpServer<S> {
         self.catalog_raw.as_deref()
     }
 
+    fn catalog_is_paginated(&self) -> bool {
+        self.tool_page_size.is_some()
+    }
+
+    fn catalog_page(&mut self, cursor: Option<&str>) -> Result<crate::ToolPage, String> {
+        paginate_catalog(&self.catalog, self.tool_page_size, cursor)
+    }
+
     fn has_tool(&self, name: &str) -> Option<bool> {
         Some(self.tools.contains_key(name))
     }
@@ -272,6 +338,36 @@ impl<S> ToolServer for McpServer<S> {
     fn call_raw(&mut self, name: &str, arguments: RawJson<'_>) -> ToolReply {
         self.call_raw_handler(name, arguments)
     }
+}
+
+pub(crate) fn paginate_catalog(
+    catalog: &Value,
+    page_size: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<crate::ToolPage, String> {
+    let Value::Array(tools) = catalog else {
+        return Err("tool catalog must be an array".to_owned());
+    };
+    let Some(page_size) = page_size else {
+        if cursor.is_some() {
+            return Err("invalid tools/list cursor".to_owned());
+        }
+        return Ok(crate::ToolPage::complete(catalog.clone()));
+    };
+    let offset = match cursor {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix("mcport:")
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .filter(|offset| *offset < tools.len())
+            .ok_or_else(|| "invalid tools/list cursor".to_owned())?,
+    };
+    let end = offset.saturating_add(page_size).min(tools.len());
+    let next_cursor = (end < tools.len()).then(|| format!("mcport:{end}"));
+    Ok(crate::ToolPage {
+        tools: Value::Array(tools[offset..end].to_vec()),
+        next_cursor,
+    })
 }
 
 #[cfg(test)]
@@ -373,6 +469,49 @@ mod tests {
             panic!("echo must succeed");
         };
         assert_eq!(value.get(), r#""new""#);
+    }
+
+    #[test]
+    fn builder_paginates_tools_with_opaque_cursors() {
+        let mut server = McpServer::new("test", "1")
+            .tool_page_size(1)
+            .tool("first", "First.", json!({"type": "object"}), |_| {
+                ToolReply::text("first")
+            })
+            .tool("second", "Second.", json!({"type": "object"}), |_| {
+                ToolReply::text("second")
+            });
+        let mut first = Vec::new();
+        serve_message(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &mut first,
+        )
+        .unwrap();
+        let first = blazingly_json::from_slice::<Value>(&first).unwrap();
+        assert_eq!(first["result"]["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first["result"]["nextCursor"], "mcport:1");
+
+        let mut second = Vec::new();
+        serve_message(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"mcport:1"}}"#,
+            &mut second,
+        )
+        .unwrap();
+        let second = blazingly_json::from_slice::<Value>(&second).unwrap();
+        assert_eq!(second["result"]["tools"].as_array().map(Vec::len), Some(1));
+        assert!(second["result"].get("nextCursor").is_none());
+
+        let mut invalid = Vec::new();
+        serve_message(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"bad"}}"#,
+            &mut invalid,
+        )
+        .unwrap();
+        let invalid = blazingly_json::from_slice::<Value>(&invalid).unwrap();
+        assert_eq!(invalid["error"]["code"], -32_602);
     }
 
     #[test]

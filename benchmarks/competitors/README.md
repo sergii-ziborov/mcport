@@ -2,7 +2,7 @@
 
 This is a reproducible black-box stdio comparison between:
 
-- `mcport 0.1.0`;
+- the current `mcport` working tree;
 - `rmcp 0.16.0`, the official Rust MCP SDK package used by this harness;
 - `rust-mcp-sdk 1.0.1`.
 
@@ -21,6 +21,26 @@ On Windows, append `.exe` to the runner path.
 
 The release profile applies the same thin LTO, one codegen unit, symbol
 stripping, and abort-on-panic settings to all server binaries.
+
+## Current-versus-baseline regression gate
+
+Set `MCPORT_BASELINE_SERVER` to a previously built mcport server executable to
+insert it directly after the current server. The runner uses nine measured
+rounds, alternates process order, and reports the median of the paired
+current/baseline latency ratios. Set `MCPORT_BASELINE_ONLY` to omit the two
+competitor SDKs, and `MCPORT_MAX_REGRESSION_PERCENT=0` to fail on any measured
+regression:
+
+```text
+MCPORT_BASELINE_SERVER=/absolute/path/to/mcport-server \
+MCPORT_BASELINE_ONLY=1 \
+MCPORT_MAX_REGRESSION_PERCENT=0 \
+benchmarks/competitors/target/release/bench-runner
+```
+
+On PowerShell, set the three names through `$env:` before invoking
+`bench-runner.exe`. Use the same compiler, release profile, hardware, and
+background-load conditions for both binaries.
 
 ## Method
 
@@ -46,10 +66,10 @@ The same `query_graph` schema, deterministic arguments, and structured result
 are used for all implementations. Response byte counts are printed so a
 smaller or incomplete output cannot silently masquerade as a speedup.
 
-## July 28, 2026 results
+## July 28, 2026 published-baseline results
 
-Intel Core Ultra 7 255U, Windows, Rust 1.97.1. Ranges below are from three
-complete runner invocations:
+These archived numbers are for `mcport 0.1.0` on an Intel Core Ultra 7 255U,
+Windows, Rust 1.97.1. Ranges below are from three complete runner invocations:
 
 | Workload | Server | Median latency | Throughput | Versus mcport |
 | --- | --- | ---: | ---: | ---: |

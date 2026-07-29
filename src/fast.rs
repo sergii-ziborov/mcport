@@ -207,21 +207,12 @@ pub(crate) fn dispatch_line(
         write_canonical_request(server, writer, request)?;
         return Ok(true);
     }
+    if line.contains("io.modelcontextprotocol") || line.contains(r#""cursor""#) {
+        return dispatch_owned_line(server, line, writer);
+    }
 
     let Ok(route) = parse_route(line) else {
-        return match from_str::<Value>(line) {
-            Ok(request) => match crate::dispatch(server, &request) {
-                Some(response) => {
-                    write(writer, &response)?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            },
-            Err(error) => {
-                write_error(writer, RequestId::Null, -32_700, error.to_string())?;
-                Ok(true)
-            }
-        };
+        return dispatch_owned_line(server, line, writer);
     };
     if route.jsonrpc.as_deref() != Some("2.0") {
         write_error(
@@ -263,6 +254,28 @@ pub(crate) fn dispatch_line(
         _ => write_error(writer, id, -32_601, format!("method not found: {method}"))?,
     }
     Ok(true)
+}
+
+#[cold]
+#[inline(never)]
+fn dispatch_owned_line(
+    server: &mut impl ToolServer,
+    line: &str,
+    writer: &mut impl Write,
+) -> io::Result<bool> {
+    match from_str::<Value>(line) {
+        Ok(request) => match crate::dispatch(server, &request) {
+            Some(response) => {
+                write(writer, &response)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        },
+        Err(error) => {
+            write_error(writer, RequestId::Null, -32_700, error.to_string())?;
+            Ok(true)
+        }
+    }
 }
 
 fn parse_route(line: &str) -> blazingly_json::Result<Route<'_>> {
@@ -414,6 +427,9 @@ fn write_tools_list(
     writer: &mut impl Write,
     id: RequestId<'_>,
 ) -> io::Result<()> {
+    if server.catalog_is_paginated() {
+        return write_first_tool_page(server, writer, id);
+    }
     if let Some(catalog) = server.catalog_raw_ref() {
         write_response_start(writer, id)?;
         writer.write_all(br#"{"tools":"#)?;
@@ -425,6 +441,39 @@ fn write_tools_list(
     }
     let catalog = server.catalog();
     write_tool_list(writer, id, &catalog)
+}
+
+#[cold]
+#[inline(never)]
+fn write_first_tool_page(
+    server: &mut impl ToolServer,
+    writer: &mut impl Write,
+    id: RequestId<'_>,
+) -> io::Result<()> {
+    match server.catalog_page(None) {
+        Ok(page) => write_tool_page(writer, id, &page),
+        Err(message) => write_error(writer, id, -32_602, message),
+    }
+}
+
+fn write_tool_page(
+    writer: &mut impl Write,
+    id: RequestId<'_>,
+    page: &crate::ToolPage,
+) -> io::Result<()> {
+    let mut result = blazingly_json::Map::new();
+    result.insert("tools".to_owned(), page.tools.clone());
+    if let Some(next_cursor) = &page.next_cursor {
+        result.insert("nextCursor".to_owned(), Value::String(next_cursor.clone()));
+    }
+    write(
+        writer,
+        &Response {
+            jsonrpc: "2.0",
+            id,
+            result: Value::Object(result),
+        },
+    )
 }
 
 fn write_tool_list(writer: &mut impl Write, id: RequestId<'_>, catalog: &Value) -> io::Result<()> {
@@ -485,10 +534,17 @@ fn write_tool_call(
             writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
             blazingly_json::to_writer(&mut *writer, &value.get())?;
             writer.write_all(br#"}],"isError":false"#)?;
-            if structured {
+            if structured && value.get().starts_with('{') {
                 writer.write_all(br#","structuredContent":"#)?;
                 writer.write_all(value.get().as_bytes())?;
             }
+            finish_response(writer, b"}")
+        }
+        ToolReply::StructuredAny { value } => {
+            write_response_start(writer, id)?;
+            writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
+            blazingly_json::to_writer(&mut *writer, &value.get())?;
+            writer.write_all(br#"}],"isError":false"#)?;
             finish_response(writer, b"}")
         }
         ToolReply::Error(message) => write(
