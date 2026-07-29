@@ -199,6 +199,13 @@ fn compare(directory: &Path, workload: &str, message_tail: &str) {
 
     let medians: Vec<_> = samples.iter_mut().map(|sample| median(sample)).collect();
     let baseline = medians[0].as_secs_f64();
+    let minimum_competitor_ratio = std::env::var("MCPORT_MIN_COMPETITOR_RATIO")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .expect("MCPORT_MIN_COMPETITOR_RATIO must be a number")
+        });
     for (index, (server, _)) in servers.iter().enumerate() {
         let elapsed = medians[index];
         let per_request = elapsed.as_secs_f64() * 1e9 / ITERATIONS as f64;
@@ -209,6 +216,16 @@ fn compare(directory: &Path, workload: &str, message_tail: &str) {
             "{server:<24} {per_request:>10.2} ns/request {throughput:>10.0} req/s \
              {bytes_per_response:>7.1} B/response {relative:>6.2}x"
         );
+        let enforced_ratio = (index > 0 && server != "mcport-baseline")
+            .then_some(minimum_competitor_ratio)
+            .flatten();
+        if let Some(minimum) = enforced_ratio {
+            assert!(
+                relative >= minimum,
+                "{server} was only {relative:.2}x slower than mcport \
+                 (required at least {minimum:.2}x)"
+            );
+        }
     }
     if servers
         .get(1)

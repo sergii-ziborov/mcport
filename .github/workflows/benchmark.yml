@@ -1,0 +1,38 @@
+name: Competitor performance guard
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benchmarks/competitors/**"
+      - ".github/workflows/benchmark.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benchmarks/competitors/**"
+      - ".github/workflows/benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stdio:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks/competitors
+      - name: Build identical release binaries
+        run: cargo build --locked --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+      - name: Require mcport to beat both competitors
+        env:
+          MCPORT_MIN_COMPETITOR_RATIO: "1.0"
+        run: benchmarks/competitors/target/release/bench-runner.exe

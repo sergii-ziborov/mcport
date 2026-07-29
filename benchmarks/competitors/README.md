@@ -42,6 +42,10 @@ On PowerShell, set the three names through `$env:` before invoking
 `bench-runner.exe`. Use the same compiler, release profile, hardware, and
 background-load conditions for both binaries.
 
+Set `MCPORT_MIN_COMPETITOR_RATIO=1.0` to fail if either competitor completes a
+workload faster than mcport. CI runs this guard on the complete black-box
+workload, with identical release settings and semantic/response-count checks.
+
 ## Method
 
 For each workload, the runner:
@@ -66,22 +70,30 @@ The same `query_graph` schema, deterministic arguments, and structured result
 are used for all implementations. Response byte counts are printed so a
 smaller or incomplete output cannot silently masquerade as a speedup.
 
-## July 28, 2026 published-baseline results
+## July 29, 2026 published results
 
-These archived numbers are for `mcport 0.1.0` on an Intel Core Ultra 7 255U,
-Windows, Rust 1.97.1. Ranges below are from three complete runner invocations:
+These numbers are for published `mcport 0.3.0` on an Intel Core Ultra 7 255U,
+Windows MSVC, Rust 1.97.1. Ranges below are from three complete runner
+invocations:
 
 | Workload | Server | Median latency | Throughput | Versus mcport |
 | --- | --- | ---: | ---: | ---: |
-| tools/list | mcport | 4.41-5.67 us | 176,410-226,858 req/s | 1.00x |
-| tools/list | rmcp | 71.12-100.79 us | 9,922-14,060 req/s | 15.97-17.78x slower |
-| tools/list | rust-mcp-sdk | 107.23-139.74 us | 7,156-9,326 req/s | 24.33-25.43x slower |
-| tools/call | mcport | 7.01-7.75 us | 129,047-142,698 req/s | 1.00x |
-| tools/call | rmcp | 61.84-96.21 us | 10,394-16,172 req/s | 8.82-12.71x slower |
-| tools/call | rust-mcp-sdk | 101.87-147.12 us | 6,797-9,816 req/s | 13.15-19.44x slower |
+| tools/list | mcport | 5.41-9.13 us | 109,473-184,988 req/s | 1.00x |
+| tools/list | rmcp | 91.72-218.26 us | 4,582-10,903 req/s | 16.97-23.89x slower |
+| tools/list | rust-mcp-sdk | 133.98-253.22 us | 3,949-7,464 req/s | 24.78-28.31x slower |
+| tools/call | mcport | 7.39-9.88 us | 101,233-135,296 req/s | 1.00x |
+| tools/call | rmcp | 82.31-112.96 us | 8,853-12,149 req/s | 8.92-11.44x slower |
+| tools/call | rust-mcp-sdk | 121.31-152.15 us | 6,573-8,243 req/s | 13.15-16.42x slower |
 
-With the shared release profile, binary sizes were 545,792 bytes for mcport,
-1,633,280 bytes for rmcp, and 1,654,272 bytes for rust-mcp-sdk.
+Five additional stabilized, nine-round paired invocations compared `0.3.0`
+against the optimized `0.1.0` baseline built with the same MSVC toolchain.
+The median invocation improved `tools/list` latency by 4.57% and `tools/call`
+latency by 6.05%. All five `tools/list` invocations improved; four of five
+`tools/call` invocations improved, with the invocation-level range spanning
+-14.68% to +3.85%.
+
+With the shared MSVC thin-LTO release profile, binary sizes were 411,136 bytes
+for mcport, 1,440,256 bytes for rmcp, and 1,469,440 bytes for rust-mcp-sdk.
 
 ## Scope and limits
 
