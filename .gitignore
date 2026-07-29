@@ -1,5 +1,6 @@
 /target/
 /benchmarks/competitors/target/
+/benchmarks/competitors/target-*/
 *.tmp
 *.swp
 .DS_Store

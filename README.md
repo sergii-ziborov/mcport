@@ -55,7 +55,7 @@ alternating pairs and fail on a configured latency regression; see
 ### Full-process competitor benchmark
 
 The committed black-box harness also compares complete release binaries over
-real stdin/stdout pipes. The archived table uses `mcport 0.1.0`, the official Rust SDK
+real stdin/stdout pipes. The table uses `mcport 0.3.0`, the official Rust SDK
 `rmcp 0.16.0`, and `rust-mcp-sdk 1.0.1`. Each server receives an initialize
 handshake followed by 10,000 uniquely identified requests. Every complete run
 warms each binary once, rotates server order across five measured rounds, and
@@ -65,12 +65,12 @@ These are ranges across three complete runs on the same Windows machine:
 
 | Workload | Server | Median latency | Throughput | Versus mcport |
 | --- | --- | ---: | ---: | ---: |
-| tools/list | mcport | 4.41-5.67 us | 176,410-226,858 req/s | 1.00x |
-| tools/list | rmcp 0.16.0 | 71.12-100.79 us | 9,922-14,060 req/s | 15.97-17.78x slower |
-| tools/list | rust-mcp-sdk 1.0.1 | 107.23-139.74 us | 7,156-9,326 req/s | 24.33-25.43x slower |
-| tools/call | mcport | 7.01-7.75 us | 129,047-142,698 req/s | 1.00x |
-| tools/call | rmcp 0.16.0 | 61.84-96.21 us | 10,394-16,172 req/s | 8.82-12.71x slower |
-| tools/call | rust-mcp-sdk 1.0.1 | 101.87-147.12 us | 6,797-9,816 req/s | 13.15-19.44x slower |
+| tools/list | mcport | 5.41-9.13 us | 109,473-184,988 req/s | 1.00x |
+| tools/list | rmcp 0.16.0 | 91.72-218.26 us | 4,582-10,903 req/s | 16.97-23.89x slower |
+| tools/list | rust-mcp-sdk 1.0.1 | 133.98-253.22 us | 3,949-7,464 req/s | 24.78-28.31x slower |
+| tools/call | mcport | 7.39-9.88 us | 101,233-135,296 req/s | 1.00x |
+| tools/call | rmcp 0.16.0 | 82.31-112.96 us | 8,853-12,149 req/s | 8.92-11.44x slower |
+| tools/call | rust-mcp-sdk 1.0.1 | 121.31-152.15 us | 6,573-8,243 req/s | 13.15-16.42x slower |
 
 The harness validates the final response from every warmup: `tools/list` must
 contain `query_graph`, while `tools/call` must reproduce all four structured
@@ -84,9 +84,9 @@ With identical thin-LTO release settings, the benchmark binaries are:
 
 | Binary | Size |
 | --- | ---: |
-| mcport | 545,792 bytes |
-| rmcp 0.16.0 | 1,633,280 bytes |
-| rust-mcp-sdk 1.0.1 | 1,654,272 bytes |
+| mcport | 411,136 bytes |
+| rmcp 0.16.0 | 1,440,256 bytes |
+| rust-mcp-sdk 1.0.1 | 1,469,440 bytes |
 
 The competitor SDKs intentionally live only in
 `benchmarks/competitors`, which the published crate excludes. Their Tokio and
