@@ -17,10 +17,10 @@ Published stable release:
 
 ```toml
 [dependencies]
-mcport = "0.3.0"
+mcport = "0.4.0"
 ```
 
-Or run `cargo add mcport@0.3.0`.
+Or run `cargo add mcport@0.4.0`.
 
 `mcport` uses `blazingly-json` for its public `Value`, `RawJson`, `RawValue`,
 and `json!` surface. Applications can import those types from `mcport` and do
@@ -46,7 +46,7 @@ relative advantage remained stable.
 A typed builder handler was another 1.31-1.35x faster than the already-fast
 `Value` handler for the measured tool call.
 
-The `0.3.0` work keeps `serve_message` as the canonical fast path. New modern
+The `0.4.0` work keeps `serve_message` as the canonical fast path. New modern
 protocol fallbacks and pagination are placed on cold paths. The black-box
 runner can also compare a current binary against an exact baseline binary in
 alternating pairs and fail on a configured latency regression; see
@@ -55,7 +55,7 @@ alternating pairs and fail on a configured latency regression; see
 ### Full-process competitor benchmark
 
 The committed black-box harness also compares complete release binaries over
-real stdin/stdout pipes. The table uses `mcport 0.3.0`, the official Rust SDK
+real stdin/stdout pipes. The table uses `mcport 0.4.0`, the official Rust SDK
 `rmcp 0.16.0`, and `rust-mcp-sdk 1.0.1`. Each server receives an initialize
 handshake followed by 10,000 uniquely identified requests. Every complete run
 warms each binary once, rotates server order across five measured rounds, and
@@ -166,6 +166,7 @@ fn main() -> std::io::Result<()> {
             "Echo the arguments.",
             json!({
                 "type": "object",
+                "description": "Any caller-defined object; every key is echoed.",
                 "additionalProperties": true
             }),
             ToolReply::structured,
@@ -212,7 +213,11 @@ fn main() -> std::io::Result<()> {
         .tool(
             "work",
             "Runs bounded cooperative work.",
-            json!({"type": "object"}),
+            json!({
+                "type": "object",
+                "properties": {"steps": {"type": "integer"}},
+                "required": ["steps"]
+            }),
             |context, arguments| {
                 if context.is_cancelled() {
                     return ToolReply::error("cancelled");
@@ -293,7 +298,11 @@ let server = McpServer::with_state("counter", "1.0.0", 0_u64)
     .typed_tool_with_state(
         "increment",
         "Increments the counter.",
-        json!({"type": "object"}),
+        json!({
+            "type": "object",
+            "properties": {"amount": {"type": "integer"}},
+            "required": ["amount"]
+        }),
         |counter, arguments: Increment| {
             *counter += arguments.amount;
             ToolReply::structured(json!({"count": *counter}))
@@ -301,6 +310,62 @@ let server = McpServer::with_state("counter", "1.0.0", 0_u64)
     );
 # let _ = server;
 ```
+
+## Schema honesty
+
+A client can only learn what a tool accepts from the schema in `tools/list`. A
+property advertised as a bare `{"type": "object"}` says nothing, so the caller
+discovers the real keys one rejected call at a time: a full round trip per
+missing field, with no way to distinguish an incomplete schema from wrong
+arguments. `mcport` checks for that shape where tools are registered rather
+than leaving it to each server's tests.
+
+Recursively, for every node with an explicit `type`:
+
+- `"type": "object"` must describe what it accepts, by carrying `properties`,
+  by giving `additionalProperties` a schema, or by declaring itself free-form
+  with a `description` and `additionalProperties: true`;
+- `"type": "array"` must carry `items`.
+
+Genuinely open-ended passthrough arguments stay legal - their keys are defined
+by another system and cannot be enumerated - but a deliberate decision must not
+look identical to silence. A tool that takes no arguments says so with
+`"properties": {}`.
+
+```rust
+use mcport::{json, McpServer, ToolReply};
+
+let server = McpServer::new("planner", "1.0.0")
+    .strict_schemas()
+    .tool(
+        "plan",
+        "Plans work under a budget.",
+        json!({
+            "type": "object",
+            "properties": {
+                "budget": {
+                    "type": "object",
+                    "properties": {"ceiling_cents": {"type": "integer"}},
+                    "required": ["ceiling_cents"]
+                }
+            },
+            "required": ["budget"]
+        }),
+        ToolReply::structured,
+    );
+assert!(server.schema_defects().is_empty());
+# let _ = server;
+```
+
+Both builders record defects at registration and expose them through
+`schema_defects()`, whether or not strict mode is on, so a server can assert on
+them in its own tests. Registration itself stays infallible, so no existing
+builder chain breaks. `strict_schemas()` is the opt-in that turns the defects
+into a startup failure: the `serve*` methods return an `InvalidInput` error
+listing every defect before the first request is read, and
+`serve_controlled_streams` does the same before any worker starts. Servers that
+implement `ToolServer` or `ConcurrentToolServer` by hand can call
+`validate_tool_schema` on their own catalog.
 
 ## Custom static dispatch
 
@@ -321,7 +386,11 @@ impl ToolServer for Echo {
         json!([{
             "name": "echo",
             "description": "Echo.",
-            "inputSchema": {"type": "object"}
+            "inputSchema": {
+                "type": "object",
+                "description": "Any caller-defined object; every key is echoed.",
+                "additionalProperties": true
+            }
         }])
     }
 
@@ -389,6 +458,9 @@ keep those values text-only.
 - consumes notifications without replies;
 - returns JSON-RPC errors without terminating the stream;
 - supports opaque cursor pagination for `tools/list`;
+- checks every advertised tool schema at registration and, under
+  `strict_schemas`, refuses to serve a catalog that does not describe what its
+  tools accept;
 - lets servers compose initialization/discovery capabilities and handle
   runtime-neutral JSON-RPC extensions such as `resources/list`,
   `resources/templates/list`, and `resources/read`;
@@ -401,7 +473,7 @@ keep those values text-only.
 
 ## Scope
 
-The `0.3.0` runtime remains server-only and stdio-only. It covers
+The `0.4.0` runtime remains server-only and stdio-only. It covers
 bounded framing/output, controlled concurrency, queue backpressure, handler
 deadlines, cooperative cancellation, progress, panic isolation, and tool
 pagination. The core owns the tools protocol and exposes capability composition
@@ -442,7 +514,7 @@ executor.
 The published registry dependency is:
 
 ```toml
-mcport = "0.3.0"
+mcport = "0.4.0"
 ```
 
 For code still importing `serde_json` everywhere, migration can be staged by
@@ -487,8 +559,8 @@ npx -y @modelcontextprotocol/inspector@latest --cli \
 
 ## Release
 
-Published: `mcport 0.3.0` is available from crates.io and can be installed with
-`cargo add mcport@0.3.0`. Earlier releases remain available for applications
+Published: `mcport 0.4.0` is available from crates.io and can be installed with
+`cargo add mcport@0.4.0`. Earlier releases remain available for applications
 that only need the original inline server surface.
 
 ## License

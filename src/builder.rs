@@ -1,6 +1,7 @@
 use crate::{
-    serve, serve_streams, serve_streams_with_config, serve_streams_with_limits, serve_with_config,
-    serve_with_limits, ServerIdentity, ToolReply, ToolServer, TransportConfig, TransportLimits,
+    schema, serve, serve_streams, serve_streams_with_config, serve_streams_with_limits,
+    serve_with_config, serve_with_limits, SchemaDefect, ServerIdentity, ToolReply, ToolServer,
+    TransportConfig, TransportLimits,
 };
 use blazingly_json::{from_str, Map, RawJson, RawValue, Value};
 use serde::de::DeserializeOwned;
@@ -24,6 +25,8 @@ pub struct McpServer<S = ()> {
     catalog_raw: Option<Box<RawValue>>,
     tool_page_size: Option<usize>,
     tools: HashMap<String, Handler<S>>,
+    schema_defects: Vec<SchemaDefect>,
+    strict_schemas: bool,
 }
 
 impl McpServer<()> {
@@ -103,6 +106,8 @@ impl<S> McpServer<S> {
             catalog_raw: None,
             tool_page_size: None,
             tools: HashMap::new(),
+            schema_defects: Vec::new(),
+            strict_schemas: false,
         }
     }
 
@@ -118,6 +123,29 @@ impl<S> McpServer<S> {
     pub fn tool_page_size(mut self, page_size: usize) -> Self {
         self.tool_page_size = Some(page_size.max(1));
         self
+    }
+
+    /// Refuses to serve a catalog whose advertised schemas do not describe
+    /// what their tools accept.
+    ///
+    /// Registration stays infallible, so this cannot break an existing
+    /// builder chain. The `serve*` methods return
+    /// [`io::ErrorKind::InvalidInput`] listing every defect, which fails at
+    /// startup rather than letting a client discover the gaps one rejected
+    /// call at a time. See [`crate::validate_tool_schema`] for the rules.
+    #[must_use]
+    pub fn strict_schemas(mut self) -> Self {
+        self.strict_schemas = true;
+        self
+    }
+
+    /// Advertised schemas that do not describe what their tool accepts.
+    ///
+    /// Always populated, so a server can assert on it in its own tests
+    /// without opting into [`McpServer::strict_schemas`].
+    #[must_use]
+    pub fn schema_defects(&self) -> &[SchemaDefect] {
+        &self.schema_defects
     }
 
     /// Registers a tool with access to shared state and owned JSON arguments.
@@ -251,6 +279,12 @@ impl<S> McpServer<S> {
     }
 
     fn register_descriptor(&mut self, name: &str, description: String, input_schema: Value) {
+        // A re-registration replaces the descriptor, so its defects go with it.
+        self.schema_defects
+            .retain(|defect| defect.tool.as_deref() != Some(name));
+        self.schema_defects
+            .extend(schema::defects_in(Some(name), &input_schema));
+
         let mut descriptor = Map::new();
         descriptor.insert("name".to_owned(), Value::String(name.to_owned()));
         descriptor.insert("description".to_owned(), Value::String(description));
@@ -331,6 +365,14 @@ impl<S> ToolServer for McpServer<S> {
         Some(self.tools.contains_key(name))
     }
 
+    fn strict_schema_defects(&self) -> &[SchemaDefect] {
+        if self.strict_schemas {
+            &self.schema_defects
+        } else {
+            &[]
+        }
+    }
+
     fn call(&mut self, name: &str, arguments: Value) -> ToolReply {
         self.call_handler(name, arguments)
     }
@@ -373,7 +415,7 @@ pub(crate) fn paginate_catalog(
 #[cfg(test)]
 mod tests {
     use super::McpServer;
-    use crate::{json, serve_message, ToolReply, ToolServer, Value};
+    use crate::{json, serve_message, SchemaDefectKind, ToolReply, ToolServer, Value};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -512,6 +554,69 @@ mod tests {
         .unwrap();
         let invalid = blazingly_json::from_slice::<Value>(&invalid).unwrap();
         assert_eq!(invalid["error"]["code"], -32_602);
+    }
+
+    #[test]
+    fn strict_schemas_refuse_to_serve_an_undescribed_catalog() {
+        let mut dishonest = McpServer::new("planner", "1.0.0")
+            .strict_schemas()
+            .typed_tool(
+                "plan",
+                "Plans.",
+                json!({
+                    "type": "object",
+                    "properties": {"budget": {"type": "object"}}
+                }),
+                |_: Value| ToolReply::text("planned"),
+            );
+        assert_eq!(dishonest.schema_defects().len(), 1);
+        assert_eq!(dishonest.schema_defects()[0].tool.as_deref(), Some("plan"));
+        assert_eq!(
+            dishonest.schema_defects()[0].kind,
+            SchemaDefectKind::UndescribedObject
+        );
+
+        let error = dishonest
+            .serve_streams(&b""[..], Vec::new())
+            .expect_err("strict schemas must refuse the catalog");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("/properties/budget"));
+
+        // Re-registering the tool honestly clears the defect it introduced.
+        let mut honest = dishonest.typed_tool(
+            "plan",
+            "Plans.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "budget": {
+                        "type": "object",
+                        "properties": {"ceiling_cents": {"type": "integer"}}
+                    }
+                }
+            }),
+            |_: Value| ToolReply::text("planned"),
+        );
+        assert!(honest.schema_defects().is_empty());
+        assert!(honest.serve_streams(&b""[..], Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn schema_defects_are_reported_without_opting_into_strict_schemas() {
+        let mut lenient = McpServer::new("planner", "1.0.0").tool(
+            "plan",
+            "Plans.",
+            json!({"type": "object", "properties": {"tags": {"type": "array"}}}),
+            ToolReply::structured,
+        );
+        assert_eq!(
+            lenient.schema_defects()[0].kind,
+            SchemaDefectKind::UndescribedArray
+        );
+        assert!(
+            lenient.serve_streams(&b""[..], Vec::new()).is_ok(),
+            "existing servers keep serving until they opt in"
+        );
     }
 
     #[test]

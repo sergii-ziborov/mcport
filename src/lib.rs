@@ -18,7 +18,11 @@
 //!         .tool(
 //!             "echo",
 //!             "Echo the arguments.",
-//!             json!({"type": "object", "additionalProperties": true}),
+//!             json!({
+//!                 "type": "object",
+//!                 "description": "Any caller-defined object; every key is echoed.",
+//!                 "additionalProperties": true
+//!             }),
 //!             ToolReply::structured,
 //!         );
 //!     server.serve()
@@ -41,7 +45,11 @@
 //!         json!([{
 //!             "name": "echo",
 //!             "description": "Echo the arguments.",
-//!             "inputSchema": {"type": "object", "additionalProperties": true}
+//!             "inputSchema": {
+//!                 "type": "object",
+//!                 "description": "Any caller-defined object; every key is echoed.",
+//!                 "additionalProperties": true
+//!             }
 //!         }])
 //!     }
 //!
@@ -68,12 +76,16 @@
 //! - malformed JSON, missing methods, and unknown methods produce JSON-RPC
 //!   errors without terminating the loop;
 //! - stream adapters bound request and response bytes and never emit a partial
-//!   JSON response when the output budget is exceeded.
+//!   JSON response when the output budget is exceeded;
+//! - both builders check every advertised tool schema at registration and
+//!   expose the defects; opting into `McpServer::strict_schemas` turns those
+//!   defects into a startup failure. See [`validate_tool_schema`].
 
 mod builder;
 mod controlled;
 mod fast;
 pub mod protocol;
+mod schema;
 mod transport;
 
 pub use blazingly_json::{json, Map, RawJson, RawValue, Value};
@@ -82,6 +94,7 @@ pub use controlled::{
     serve_controlled, serve_controlled_streams, CancellationToken, ConcurrentMcpServer,
     ConcurrentToolServer, RequestContext, RuntimeConfig,
 };
+pub use schema::{validate_tool_schema, SchemaDefect, SchemaDefectKind};
 pub use transport::{FlushPolicy, TransportConfig, TransportLimits};
 
 use serde::Serialize;
@@ -366,6 +379,18 @@ pub trait ToolServer {
     /// Returning `None` keeps the standard `method not found` response.
     fn call_method(&mut self, _method: &str, _params: Value) -> Option<MethodReply> {
         None
+    }
+
+    /// Advertised schemas that do not describe what their tool accepts.
+    ///
+    /// The stream adapters refuse to start when this is non-empty, so an
+    /// incomplete schema fails at startup instead of being discovered by a
+    /// client one rejected call at a time. Implementations that build their
+    /// catalog by hand inherit an empty slice and are unaffected; they can
+    /// check their schemas with [`validate_tool_schema`] in their own tests.
+    /// Both builders fill this in once [`McpServer::strict_schemas`] is set.
+    fn strict_schema_defects(&self) -> &[SchemaDefect] {
+        &[]
     }
 }
 

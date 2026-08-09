@@ -1,4 +1,4 @@
-use crate::{protocol, serve_message, ToolServer, Value};
+use crate::{protocol, schema, serve_message, ToolServer, Value};
 use std::io::{self, BufRead, Write};
 
 const MIN_RESPONSE_BYTES: usize = 256;
@@ -167,6 +167,7 @@ pub(crate) fn serve_streams_bounded(
     writer: impl Write,
     limits: TransportLimits,
 ) -> io::Result<()> {
+    schema::reject_defects(server.strict_schema_defects())?;
     serve_streams_impl::<true>(server, reader, writer, limits.validate()?, 1)
 }
 
@@ -176,6 +177,7 @@ pub(crate) fn serve_streams_configured(
     writer: impl Write,
     config: TransportConfig,
 ) -> io::Result<()> {
+    schema::reject_defects(server.strict_schema_defects())?;
     let config = config.validate()?;
     match config.flush_policy {
         FlushPolicy::PerMessage => {

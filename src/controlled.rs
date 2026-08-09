@@ -1,7 +1,7 @@
 use crate::transport::{read_frame, FrameStatus, ResponseBuffer};
 use crate::{
-    FlushPolicy, Map, MethodReply, RawJson, RawValue, ServerIdentity, ToolPage, ToolReply,
-    ToolServer, TransportLimits, Value,
+    schema, FlushPolicy, Map, MethodReply, RawJson, RawValue, SchemaDefect, ServerIdentity,
+    ToolPage, ToolReply, ToolServer, TransportLimits, Value,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -301,6 +301,16 @@ pub trait ConcurrentToolServer: Send + Sync + 'static {
     ) -> Option<MethodReply> {
         None
     }
+
+    /// Advertised schemas that do not describe what their tool accepts.
+    ///
+    /// [`serve_controlled_streams`] refuses to start when this is non-empty.
+    /// Hand-written implementations inherit an empty slice; see
+    /// [`crate::validate_tool_schema`] and
+    /// [`ConcurrentMcpServer::strict_schemas`].
+    fn strict_schema_defects(&self) -> &[SchemaDefect] {
+        &[]
+    }
 }
 
 type ValueHandler = Box<dyn Fn(&RequestContext, Value) -> ToolReply + Send + Sync + 'static>;
@@ -318,6 +328,8 @@ pub struct ConcurrentMcpServer {
     catalog_raw: Option<Box<RawValue>>,
     tool_page_size: Option<usize>,
     tools: HashMap<String, Handler>,
+    schema_defects: Vec<SchemaDefect>,
+    strict_schemas: bool,
 }
 
 impl ConcurrentMcpServer {
@@ -330,6 +342,8 @@ impl ConcurrentMcpServer {
             catalog_raw: None,
             tool_page_size: None,
             tools: HashMap::new(),
+            schema_defects: Vec::new(),
+            strict_schemas: false,
         }
     }
 
@@ -345,6 +359,27 @@ impl ConcurrentMcpServer {
     pub fn tool_page_size(mut self, page_size: usize) -> Self {
         self.tool_page_size = Some(page_size.max(1));
         self
+    }
+
+    /// Refuses to serve a catalog whose advertised schemas do not describe
+    /// what their tools accept.
+    ///
+    /// Registration stays infallible. [`ConcurrentMcpServer::serve`] returns
+    /// [`io::ErrorKind::InvalidInput`] listing every defect before any worker
+    /// starts. See [`crate::validate_tool_schema`] for the rules.
+    #[must_use]
+    pub fn strict_schemas(mut self) -> Self {
+        self.strict_schemas = true;
+        self
+    }
+
+    /// Advertised schemas that do not describe what their tool accepts.
+    ///
+    /// Always populated, so a server can assert on it in its own tests
+    /// without opting into [`ConcurrentMcpServer::strict_schemas`].
+    #[must_use]
+    pub fn schema_defects(&self) -> &[SchemaDefect] {
+        &self.schema_defects
     }
 
     /// Registers a context-aware owned-value handler.
@@ -414,6 +449,12 @@ impl ConcurrentMcpServer {
     }
 
     fn register_descriptor(&mut self, name: &str, description: String, input_schema: Value) {
+        // A re-registration replaces the descriptor, so its defects go with it.
+        self.schema_defects
+            .retain(|defect| defect.tool.as_deref() != Some(name));
+        self.schema_defects
+            .extend(schema::defects_in(Some(name), &input_schema));
+
         let mut descriptor = Map::new();
         descriptor.insert("name".to_owned(), Value::String(name.to_owned()));
         descriptor.insert("description".to_owned(), Value::String(description));
@@ -465,6 +506,14 @@ impl ConcurrentToolServer for ConcurrentMcpServer {
 
     fn has_tool(&self, name: &str) -> Option<bool> {
         Some(self.tools.contains_key(name))
+    }
+
+    fn strict_schema_defects(&self) -> &[SchemaDefect] {
+        if self.strict_schemas {
+            &self.schema_defects
+        } else {
+            &[]
+        }
     }
 
     fn call(&self, context: &RequestContext, name: &str, arguments: Value) -> ToolReply {
@@ -618,6 +667,7 @@ where
     R: BufRead,
     W: Write + Send + 'static,
 {
+    schema::reject_defects(server.strict_schema_defects())?;
     config.validate()?;
     let (output_tx, output_rx) = mpsc::sync_channel(config.output_queue_depth);
     let writer_handle =
@@ -1219,6 +1269,26 @@ mod tests {
         assert_eq!(output[0]["method"], "notifications/progress");
         assert_eq!(output[1]["params"]["progress"], 2.0);
         assert_eq!(output[2]["result"]["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn strict_schemas_refuse_to_start_the_controlled_runtime() {
+        let server = ConcurrentMcpServer::new("test", "1").strict_schemas().tool(
+            "work",
+            "work",
+            json!({"type": "object", "properties": {"steps": {"type": "array"}}}),
+            |_, arguments| ToolReply::structured(arguments),
+        );
+        assert_eq!(server.schema_defects().len(), 1);
+        let error = serve_controlled_streams(
+            Arc::new(server),
+            &b""[..],
+            SharedWriter::default(),
+            RuntimeConfig::default(),
+        )
+        .expect_err("strict schemas must refuse the catalog");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("/properties/steps"));
     }
 
     #[test]
