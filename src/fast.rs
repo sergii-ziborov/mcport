@@ -175,7 +175,7 @@ struct ToolList<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolResult<'a> {
-    content: [TextContent<'a>; 1],
+    content: &'a [TextContent<'a>],
     is_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     structured_content: Option<&'a Value>,
@@ -501,36 +501,46 @@ fn write_tool_call(
         None => from_str::<RawJson<'_>>("{}").expect("empty object is valid JSON"),
     };
     match server.call_raw(name, arguments) {
-        ToolReply::Success { value, structured } => {
-            let structured = structured && value.is_object();
-            let text = if structured {
-                blazingly_json::to_string_pretty(&value)
-            } else {
-                blazingly_json::to_string(&value)
-            }
-            .unwrap_or_else(|_| "{}".to_owned());
+        ToolReply::Success { value, payload } => {
+            let structured = payload.is_structured() && value.is_object();
+            let text = (payload.has_text() || !structured).then(|| {
+                if structured {
+                    blazingly_json::to_string_pretty(&value)
+                } else {
+                    blazingly_json::to_string(&value)
+                }
+                .unwrap_or_else(|_| "{}".to_owned())
+            });
+            let content = text.as_deref().map(|text| TextContent {
+                r#type: "text",
+                text,
+            });
             write(
                 writer,
                 &Response {
                     jsonrpc: "2.0",
                     id,
                     result: ToolResult {
-                        content: [TextContent {
-                            r#type: "text",
-                            text: &text,
-                        }],
+                        content: content.as_slice(),
                         is_error: false,
                         structured_content: structured.then_some(&value),
                     },
                 },
             )
         }
-        ToolReply::Serialized { value, structured } => {
+        ToolReply::Serialized { value, payload } => {
+            let structured = payload.is_structured() && value.get().starts_with('{');
             write_response_start(writer, id)?;
-            writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
-            blazingly_json::to_writer(&mut *writer, &value.get())?;
-            writer.write_all(br#"}],"isError":false"#)?;
-            if structured && value.get().starts_with('{') {
+            if payload.has_text() || !structured {
+                writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
+                blazingly_json::to_writer(&mut *writer, &value.get())?;
+                writer.write_all(br#"}],"isError":false"#)?;
+            } else {
+                // The text block is the whole payload a second time. A client
+                // that reads structured output has already been given it.
+                writer.write_all(br#"{"content":[],"isError":false"#)?;
+            }
+            if structured {
                 writer.write_all(br#","structuredContent":"#)?;
                 writer.write_all(value.get().as_bytes())?;
             }
@@ -549,7 +559,7 @@ fn write_tool_call(
                 jsonrpc: "2.0",
                 id,
                 result: ToolResult {
-                    content: [TextContent {
+                    content: &[TextContent {
                         r#type: "text",
                         text: &message,
                     }],

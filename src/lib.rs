@@ -154,6 +154,43 @@ impl ServerIdentity {
     }
 }
 
+/// Which representations of one successful result reach the client.
+///
+/// MCP recommends mirroring `structuredContent` into a text block so a client
+/// that reads only `content` still sees the result. That mirror is the entire
+/// payload a second time, and it is the pretty-printed copy, so it is the
+/// larger of the two blocks. A server whose client reads structured output can
+/// drop it and roughly halve every response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolPayload {
+    /// Compact text content only. No `structuredContent`.
+    Text,
+    /// `structuredContent` plus the text mirror the MCP revision recommends
+    /// for clients that read only `content`.
+    #[default]
+    Mirrored,
+    /// `structuredContent` only, with an empty content array.
+    ///
+    /// A deliberate departure from the backwards-compatibility recommendation:
+    /// a client that ignores `structuredContent` sees an empty result, so this
+    /// is only correct when the server knows what reads it.
+    Structured,
+}
+
+impl ToolPayload {
+    /// Whether this payload carries `structuredContent`.
+    #[must_use]
+    pub fn is_structured(self) -> bool {
+        matches!(self, Self::Mirrored | Self::Structured)
+    }
+
+    /// Whether this payload carries a text content block.
+    #[must_use]
+    pub fn has_text(self) -> bool {
+        matches!(self, Self::Text | Self::Mirrored)
+    }
+}
+
 /// Outcome of one `tools/call` dispatch.
 #[derive(Debug, Clone)]
 pub enum ToolReply {
@@ -161,15 +198,15 @@ pub enum ToolReply {
     Success {
         /// Tool output value serialized into the text content block.
         value: Value,
-        /// Whether to also attach `structuredContent`.
-        structured: bool,
+        /// Which representations reach the client.
+        payload: ToolPayload,
     },
     /// Pre-serialized tool output used by the fast response path.
     Serialized {
         /// One complete validated JSON value.
         value: Box<RawValue>,
-        /// Whether to also attach the object as `structuredContent`.
-        structured: bool,
+        /// Which representations reach the client.
+        payload: ToolPayload,
     },
     /// Pre-serialized non-object structured output for MCP 2026-07-28.
     ///
@@ -189,7 +226,7 @@ impl ToolReply {
     /// JSON [`Value`] first.
     #[must_use]
     pub fn structured(value: impl Serialize) -> Self {
-        Self::success(value, true)
+        Self::success_with(value, ToolPayload::Mirrored)
     }
 
     /// Success carrying compact text content only.
@@ -197,21 +234,45 @@ impl ToolReply {
     /// Any serializable result is accepted.
     #[must_use]
     pub fn text(value: impl Serialize) -> Self {
-        Self::success(value, false)
+        Self::success_with(value, ToolPayload::Text)
+    }
+
+    /// Success carrying `structuredContent` without the text mirror.
+    ///
+    /// Halves the response for a client that reads structured output, and
+    /// leaves nothing readable for a client that does not.
+    #[must_use]
+    pub fn structured_only(value: impl Serialize) -> Self {
+        Self::success_with(value, ToolPayload::Structured)
+    }
+
+    /// Serializes a successful tool result once, mirroring when `structured`.
+    #[must_use]
+    pub fn success(value: impl Serialize, structured: bool) -> Self {
+        Self::success_with(
+            value,
+            if structured {
+                ToolPayload::Mirrored
+            } else {
+                ToolPayload::Text
+            },
+        )
     }
 
     /// Serializes a successful tool result once.
     ///
     /// Object-shaped output is structured in every supported revision.
     /// Arrays and scalars are structured in MCP 2026-07-28 and remain
-    /// text-only when serving a legacy revision.
+    /// text-only when serving a legacy revision, so a non-object value never
+    /// takes a structured-only payload: dropping the text block would leave
+    /// the legacy client with nothing at all.
     #[must_use]
-    pub fn success(value: impl Serialize, structured: bool) -> Self {
+    pub fn success_with(value: impl Serialize, payload: ToolPayload) -> Self {
         match blazingly_json::to_raw_value(&value) {
-            Ok(value) if structured && !value.get().starts_with('{') => {
+            Ok(value) if payload.is_structured() && !value.get().starts_with('{') => {
                 Self::StructuredAny { value }
             }
-            Ok(value) => Self::Serialized { structured, value },
+            Ok(value) => Self::Serialized { payload, value },
             Err(error) => Self::Error(format!("tool result serialization failed: {error}")),
         }
     }
@@ -674,12 +735,12 @@ fn tool_call_response(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let mut response = match server.call(name, arguments) {
-        ToolReply::Success { value, structured } => protocol::tool_success(id, &value, structured),
-        ToolReply::Serialized { value, structured } => {
-            protocol::tool_success_raw(id, &value, structured)
-        }
+        ToolReply::Success { value, payload } => protocol::tool_success(id, &value, payload),
+        ToolReply::Serialized { value, payload } => protocol::tool_success_raw(id, &value, payload),
         ToolReply::StructuredAny { value } if modern => protocol::tool_success_raw_any(id, &value),
-        ToolReply::StructuredAny { value } => protocol::tool_success_raw(id, &value, false),
+        ToolReply::StructuredAny { value } => {
+            protocol::tool_success_raw(id, &value, ToolPayload::Text)
+        }
         ToolReply::Error(message) => protocol::tool_error(id, message),
     };
     if modern {

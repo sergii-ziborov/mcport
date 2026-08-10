@@ -1,5 +1,6 @@
 //! JSON-RPC and MCP tool-result message shapes.
 
+use crate::ToolPayload;
 use blazingly_json::{json, RawValue, Value};
 
 /// A JSON-RPC success envelope.
@@ -38,21 +39,23 @@ pub(crate) fn mark_complete(response: &mut Value) {
     }
 }
 
-/// A successful `tools/call` result with text content, and, when
-/// `structured` is set, a `structuredContent` mirror of the same value.
+/// A successful `tools/call` result carrying the representations `payload`
+/// selects: text content, a `structuredContent` mirror of it, or structured
+/// content alone.
 #[must_use]
-pub fn tool_success(id: &Value, value: &Value, structured: bool) -> Value {
-    let structured = structured && value.is_object();
-    let text = if structured {
-        blazingly_json::to_string_pretty(value)
+pub fn tool_success(id: &Value, value: &Value, payload: ToolPayload) -> Value {
+    let structured = payload.is_structured() && value.is_object();
+    let text = if payload.has_text() || !structured {
+        let rendered = if structured {
+            blazingly_json::to_string_pretty(value)
+        } else {
+            blazingly_json::to_string(value)
+        };
+        Some(rendered.unwrap_or_else(|_| "{}".to_owned()))
     } else {
-        blazingly_json::to_string(value)
-    }
-    .unwrap_or_else(|_| "{}".to_owned());
-    let mut result = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false
-    });
+        None
+    };
+    let mut result = json!({"content": content_block(text.as_deref()), "isError": false});
     if structured {
         if let Some(object) = result.as_object_mut() {
             object.insert("structuredContent".to_owned(), value.clone());
@@ -63,20 +66,23 @@ pub fn tool_success(id: &Value, value: &Value, structured: bool) -> Value {
 
 /// A successful `tools/call` result built from one pre-serialized value.
 #[must_use]
-pub fn tool_success_raw(id: &Value, value: &RawValue, structured: bool) -> Value {
-    let mut result = json!({
-        "content": [{"type": "text", "text": value.get()}],
-        "isError": false
-    });
-    let structured_value = if structured && value.get().starts_with('{') {
+pub fn tool_success_raw(id: &Value, value: &RawValue, payload: ToolPayload) -> Value {
+    let structured_value = if payload.is_structured() && value.get().starts_with('{') {
         blazingly_json::from_str::<Value>(value.get()).ok()
     } else {
         None
     };
+    let text = (payload.has_text() || structured_value.is_none()).then(|| value.get());
+    let mut result = json!({"content": content_block(text), "isError": false});
     if let (Some(object), Some(value)) = (result.as_object_mut(), structured_value) {
         object.insert("structuredContent".to_owned(), value);
     }
     success(id, &result)
+}
+
+/// One text block, or none at all when the payload carries structure only.
+fn content_block(text: Option<&str>) -> Value {
+    text.map_or_else(|| json!([]), |text| json!([{"type": "text", "text": text}]))
 }
 
 /// A successful MCP 2026-07-28 result with arbitrary JSON structured content.
@@ -110,11 +116,12 @@ pub fn tool_error(id: &Value, message: impl Into<String>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::ToolPayload;
     use blazingly_json::json;
 
     #[test]
     fn shapes_match_the_mcp_contract() {
-        let ok = super::tool_success(&json!(1), &json!({"nodes": 5}), true);
+        let ok = super::tool_success(&json!(1), &json!({"nodes": 5}), ToolPayload::Mirrored);
         assert_eq!(ok["result"]["isError"], false);
         assert_eq!(ok["result"]["structuredContent"]["nodes"], 5);
         assert!(ok["result"]["content"][0]["text"]
@@ -122,10 +129,10 @@ mod tests {
             .unwrap()
             .contains("nodes"));
 
-        let flat = super::tool_success(&json!(2), &json!({"nodes": 5}), false);
+        let flat = super::tool_success(&json!(2), &json!({"nodes": 5}), ToolPayload::Text);
         assert!(flat["result"].get("structuredContent").is_none());
 
-        let scalar = super::tool_success(&json!(3), &json!(5), true);
+        let scalar = super::tool_success(&json!(3), &json!(5), ToolPayload::Mirrored);
         assert!(scalar["result"].get("structuredContent").is_none());
 
         let raw_scalar = blazingly_json::to_raw_value(&5).unwrap();
@@ -137,5 +144,49 @@ mod tests {
 
         let protocol = super::error(&json!(5), -32_601, "method not found: x");
         assert_eq!(protocol["error"]["code"], -32_601);
+    }
+
+    #[test]
+    fn structured_only_drops_the_mirror_and_roughly_halves_the_response() {
+        let value = json!({
+            "endpoints": (0..40)
+                .map(|index| json!({"method": "GET", "path": format!("/resource/{index}")}))
+                .collect::<Vec<_>>()
+        });
+
+        let mirrored = super::tool_success(&json!(1), &value, ToolPayload::Mirrored);
+        let structured = super::tool_success(&json!(1), &value, ToolPayload::Structured);
+
+        assert_eq!(
+            mirrored["result"]["structuredContent"], structured["result"]["structuredContent"],
+            "the machine-readable half is identical"
+        );
+        assert!(
+            structured["result"]["content"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "the mirror is gone, and the field it lived in is still present"
+        );
+
+        let mirrored_bytes = blazingly_json::to_string(&mirrored).unwrap().len();
+        let structured_bytes = blazingly_json::to_string(&structured).unwrap().len();
+        assert!(
+            structured_bytes * 2 < mirrored_bytes,
+            "the pretty-printed mirror is the larger half: {mirrored_bytes} -> {structured_bytes}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_structured_keeps_its_text_block() {
+        // Legacy revisions carry arrays and scalars through text only. Dropping
+        // the text block there would answer with nothing at all.
+        for value in [json!([1, 2, 3]), json!(7), json!("done")] {
+            let reply = super::tool_success(&json!(1), &value, ToolPayload::Structured);
+            assert!(
+                reply["result"]["content"][0]["text"].is_string(),
+                "{value} must still reach a client that reads content"
+            );
+            assert!(reply["result"].get("structuredContent").is_none());
+        }
     }
 }
