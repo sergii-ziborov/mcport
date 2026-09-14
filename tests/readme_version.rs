@@ -14,15 +14,32 @@ fn readme_install_version_matches_the_package() {
 }
 
 #[test]
-fn benchmark_docs_agree_on_historical_sdk_table() {
+fn benchmark_docs_agree_on_published_sdk_table() {
     let root = include_str!("../README.md");
     let competitors = include_str!("../benchmarks/competitors/README.md");
     assert!(
-        root.contains("published mcport 0.3.0") && competitors.contains("published `mcport 0.3.0`"),
-        "SDK comparison numbers must stay attributed to 0.3.0 until a pinned rerun"
+        root.contains("published mcport 0.6.0") && competitors.contains("published `mcport 0.6.0`"),
+        "SDK comparison numbers must be attributed to measured 0.6.0"
     );
     assert!(
-        !root.contains("mcport 0.4.0") || !root.contains("The table uses `mcport 0.4.0`"),
-        "do not relabel the historical SDK table as 0.4.0"
+        root.contains("three complete runner invocations")
+            && competitors.contains("three complete runner invocations"),
+        "both READMEs must cite the three-invocation method"
+    );
+    assert!(
+        root.contains("rustc 1.97.1") && competitors.contains("rustc 1.97.1"),
+        "both READMEs must record the MSVC rustc used for the published table"
+    );
+    for needle in [
+        "12.42–14.72×",
+        "17.76–23.37×",
+        "7.91–11.11×",
+        "11.91–13.64×",
+    ] {
+        assert!(root.contains(needle), "root README missing {needle}");
+    }
+    assert!(
+        !root.contains("These historical numbers are for **published mcport 0.3.0**"),
+        "do not keep 0.3.0 as the primary published claim"
     );
 }

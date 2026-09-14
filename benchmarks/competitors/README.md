@@ -13,11 +13,13 @@ SDKs are benchmark-only dependencies.
 ## Run
 
 ```text
-cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+cargo +stable-x86_64-pc-windows-msvc build --locked --manifest-path benchmarks/competitors/Cargo.toml --release --bins
 benchmarks/competitors/target/release/bench-runner
 ```
 
-On Windows, append `.exe` to the runner path.
+On Windows, append `.exe` to the runner path. The published 0.6.0 table used
+this MSVC host toolchain (`rustc 1.97.1`). A GNU default target is a
+different measurement.
 
 The release profile applies the same thin LTO, one codegen unit, symbol
 stripping, and abort-on-panic settings to all server binaries.
@@ -70,44 +72,43 @@ The same `query_graph` schema, deterministic arguments, and structured result
 are used for all implementations. Response byte counts are printed so a
 smaller or incomplete output cannot silently masquerade as a speedup.
 
-## July 29, 2026 published results
+## 14 September 2026 published results
 
-These numbers are for published `mcport 0.3.0` (git tag `v0.3.0`, commit
-`99c8817`) on an Intel Core Ultra 7 255U, Windows MSVC, Rust 1.97.1. They are
-a historical SDK comparison, not a rerun of 0.5.0 or 0.6.0. The root README
-previously labeled this same table as 0.4.0; that crate was never published.
-Ranges below are from three complete runner invocations:
+These numbers are for published `mcport 0.6.0` (git tag `v0.6.0`, commit
+`c057d6c`) on an Intel Core Ultra 7 255U, Windows MSVC, rustc 1.97.1. The
+harness used the current 0.6.0 tree (`d90b712`; publish-workflow commits
+only) against rmcp 0.16.0 and rust-mcp-sdk 1.0.1. Ranges below are from
+three complete runner invocations:
 
 | Workload | Server | Median latency | Throughput | Versus mcport |
 | --- | --- | ---: | ---: | ---: |
-| tools/list | mcport | 5.41-9.13 us | 109,473-184,988 req/s | 1.00x |
-| tools/list | rmcp | 91.72-218.26 us | 4,582-10,903 req/s | 16.97-23.89x slower |
-| tools/list | rust-mcp-sdk | 133.98-253.22 us | 3,949-7,464 req/s | 24.78-28.31x slower |
-| tools/call | mcport | 7.39-9.88 us | 101,233-135,296 req/s | 1.00x |
-| tools/call | rmcp | 82.31-112.96 us | 8,853-12,149 req/s | 8.92-11.44x slower |
-| tools/call | rust-mcp-sdk | 121.31-152.15 us | 6,573-8,243 req/s | 13.15-16.42x slower |
+| tools/list | mcport | 2.73-3.08 us | 325,135-365,763 req/s | 1.00x |
+| tools/list | rmcp | 33.95-43.47 us | 23,007-29,454 req/s | 12.42-14.72x slower |
+| tools/list | rust-mcp-sdk | 48.54-69.02 us | 14,489-20,600 req/s | 17.76-23.37x slower |
+| tools/call | mcport | 3.68-4.89 us | 204,589-271,479 req/s | 1.00x |
+| tools/call | rmcp | 34.24-40.93 us | 24,431-29,208 req/s | 7.91-11.11x slower |
+| tools/call | rust-mcp-sdk | 50.24-58.19 us | 17,184-19,903 req/s | 11.91-13.64x slower |
 
-Five additional stabilized, nine-round paired invocations compared `0.3.0`
-against the optimized `0.1.0` baseline built with the same MSVC toolchain.
-The median invocation improved `tools/list` latency by 4.57% and `tools/call`
-latency by 6.05%. All five `tools/list` invocations improved; four of five
-`tools/call` invocations improved, with the invocation-level range spanning
--14.68% to +3.85%.
+With the shared MSVC thin-LTO release profile, binary sizes were 427,520
+bytes for mcport, 1,440,768 bytes for rmcp, and 1,470,976 bytes for
+rust-mcp-sdk.
 
-With the shared MSVC thin-LTO release profile, binary sizes were 411,136 bytes
-for mcport, 1,440,256 bytes for rmcp, and 1,469,440 bytes for rust-mcp-sdk.
+### Invocations
 
-## 14 September 2026 working-tree check
+Each line is that invocation's median full-process time / 10,000.
 
-One release-profile invocation of this 0.6.0 checkout, with the same pinned
-SDKs, still finished faster than both competitors on Windows. This is a
-single-run verification, not a replacement for the three-run July 29 table
-and not a p50 individual RTT.
+1. `tools/list` mcport 2734.01 ns, rmcp 12.42x, rust-mcp-sdk 17.76x; `tools/call` mcport 4887.85 ns, rmcp 7.91x, rust-mcp-sdk 11.91x
+2. `tools/list` mcport 3075.65 ns, rmcp 12.73x, rust-mcp-sdk 19.52x; `tools/call` mcport 4136.61 ns, rmcp 8.28x, rust-mcp-sdk 12.30x
+3. `tools/list` mcport 2953.71 ns, rmcp 14.72x, rust-mcp-sdk 23.37x; `tools/call` mcport 3683.52 ns, rmcp 11.11x, rust-mcp-sdk 13.64x
 
-| Workload | Versus rmcp 0.16.0 | Versus rust-mcp-sdk 1.0.1 |
-| --- | ---: | ---: |
-| tools/list | 13.18× | 20.11× |
-| tools/call | 8.29× | 12.03× |
+## Historical 29 July 2026 results (mcport 0.3.0)
+
+The previous published claim used `v0.3.0` / `99c8817` on the same class of
+machine and toolchain. It is no longer the primary table. Ranges then were
+16.97-23.89x / 24.78-28.31x for `tools/list` and 8.92-11.44x / 13.15-16.42x
+for `tools/call` versus rmcp 0.16.0 and rust-mcp-sdk 1.0.1. Five paired
+invocations against the optimized 0.1.0 baseline improved median `tools/list`
+latency by 4.57% and `tools/call` by 6.05%.
 
 ## Scope and limits
 

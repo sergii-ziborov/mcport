@@ -21,7 +21,7 @@ After the 0.6.0 convenience surface:
 
 | Stage | Intent | Status in this tree |
 | --- | --- | --- |
-| A | README, versions, benchmark provenance, standalone quickstart | Done in 0.6.0. Install is `0.6.0`. SDK table stays attributed to published 0.3.0 (`v0.3.0` / `99c8817`). Examples are complete files. |
+| A | README, versions, benchmark provenance, standalone quickstart | Done. Install is `0.6.1`. The published SDK table is the 14 September 2026 three-run MSVC measurement of 0.6.0 (`v0.6.0` / `c057d6c`). Examples are complete files. |
 | B | Protocol boundaries, descriptor, clear results/errors | Done for the first cut: `ToolDefinition`, annotations, `literal_text`, `ToolError` / `IntoToolReply` / `Json<T>`. |
 | C | Optional `#[tool]`, `tools!`, limited schema generation | Done as the default `macros` feature. `#[context]` is deferred. Schemars is not a runtime dependency. |
 | D | Modern fast path, catalog finalize, macro/manual guard | Modern `tools/list` and `tools/call` keep borrowed routing. Catalog bytes are serialized once after registration. Macro/manual parity tests exist; numeric regression thresholds are not frozen yet. |

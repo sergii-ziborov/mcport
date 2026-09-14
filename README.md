@@ -18,7 +18,7 @@ MCPort is a library. Add it to the Rust binary that will serve your tools.
 ```text
 cargo new my-mcp-server
 cd my-mcp-server
-cargo add mcport@0.6.0
+cargo add mcport@0.6.1
 cargo add serde --features derive
 ```
 
@@ -221,11 +221,13 @@ Two kinds of comparison must remain separate:
 
 ### Recorded SDK comparison
 
-These historical numbers are for **published mcport 0.3.0** (tag `v0.3.0`,
-commit `99c8817`, 29 July 2026) on Intel Core Ultra 7 255U / Windows MSVC /
-Rust 1.97.1, against rmcp 0.16.0 and rust-mcp-sdk 1.0.1. They are **not** a
-new measurement of 0.5.0 or 0.6.0. The same table was previously mislabeled
-`0.4.0` in this README; `0.4.0` was never published to crates.io.
+These numbers are for **published mcport 0.6.0** (tag `v0.6.0`, commit
+`c057d6c`, 14 September 2026) on Intel Core Ultra 7 255U / Windows MSVC /
+rustc 1.97.1, against rmcp 0.16.0 and rust-mcp-sdk 1.0.1. Ranges are from
+three complete runner invocations. This crate revision only rebinds that
+measurement; the runtime is the same 0.6.0 code. A 29 July 2026 table for
+0.3.0 was previously the published claim, and was once mislabeled `0.4.0`;
+`0.4.0` was never published to crates.io.
 
 The runner reports the median total time of a pipelined series divided by
 10,000. This is amortized time per request, not a p50 individual round-trip
@@ -233,15 +235,16 @@ latency.
 
 | Workload | Compared SDK | Recorded slowdown relative to MCPort |
 | --- | --- | ---: |
-| tools/list | rmcp 0.16.0 | 16.97–23.89× |
-| tools/list | rust-mcp-sdk 1.0.1 | 24.78–28.31× |
-| tools/call | rmcp 0.16.0 | 8.92–11.44× |
-| tools/call | rust-mcp-sdk 1.0.1 | 13.15–16.42× |
+| tools/list | rmcp 0.16.0 | 12.42–14.72× |
+| tools/list | rust-mcp-sdk 1.0.1 | 17.76–23.37× |
+| tools/call | rmcp 0.16.0 | 7.91–11.11× |
+| tools/call | rust-mcp-sdk 1.0.1 | 11.91–13.64× |
 
-Reproduce the checked-in harness from a repository checkout:
+Reproduce the checked-in harness from a repository checkout. On Windows, the
+published method uses the MSVC host toolchain:
 
 ```text
-cargo build --locked --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+cargo +stable-x86_64-pc-windows-msvc build --locked --manifest-path benchmarks/competitors/Cargo.toml --release --bins
 benchmarks/competitors/target/release/bench-runner
 ```
 
