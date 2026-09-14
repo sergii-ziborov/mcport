@@ -35,17 +35,21 @@ jobs:
       - name: Verify macros package
         run: cargo publish --locked --dry-run --manifest-path mcport-macros/Cargo.toml
       - name: Publish macros to crates.io
-        run: cargo publish --locked --manifest-path mcport-macros/Cargo.toml
-      - name: Wait for crates.io to index mcport-macros
         run: |
-          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' mcport-macros/Cargo.toml | head -n 1)
-          for attempt in $(seq 1 20); do
-            if cargo search mcport-macros --limit 1 | grep -q "mcport-macros = \"$VERSION\""; then
+          set +e
+          output=$(cargo publish --locked --manifest-path mcport-macros/Cargo.toml 2>&1)
+          status=$?
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          printf '%s\n' "$output" | grep -Eqi 'already exists|already uploaded'
+      - name: Publish to crates.io
+        run: |
+          for attempt in $(seq 1 12); do
+            if cargo publish --locked --package mcport; then
               exit 0
             fi
-            sleep 15
+            sleep 20
           done
-          echo "mcport-macros $VERSION is not visible on crates.io yet" >&2
           exit 1
-      - name: Publish to crates.io
-        run: cargo publish --locked --package mcport
