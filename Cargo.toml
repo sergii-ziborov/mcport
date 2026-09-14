@@ -1,9 +1,14 @@
+[workspace]
+members = ["mcport-macros"]
+exclude = ["benchmarks/competitors"]
+resolver = "2"
+
 [package]
 name = "mcport"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Fast, bounded, Tokio-free MCP stdio runtime with controlled tools"
+description = "Fast, bounded, Tokio-free MCP stdio runtime with FastMCP-like Rust tools"
 license = "MIT"
 authors = ["Sergii Ziborov <sergii.ziborov@gmail.com>"]
 homepage = "https://weavatrix.com"
@@ -16,10 +21,16 @@ categories = ["development-tools", "network-programming"]
 
 [dependencies]
 blazingly-json = "0.1.0"
+mcport-macros = { path = "mcport-macros", version = "0.6.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 
 [features]
+default = ["macros"]
+macros = ["dep:mcport-macros"]
 subprocess-tests = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bench]]
 name = "runtime"

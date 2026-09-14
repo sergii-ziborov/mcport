@@ -72,9 +72,11 @@ smaller or incomplete output cannot silently masquerade as a speedup.
 
 ## July 29, 2026 published results
 
-These numbers are for published `mcport 0.3.0` on an Intel Core Ultra 7 255U,
-Windows MSVC, Rust 1.97.1. Ranges below are from three complete runner
-invocations:
+These numbers are for published `mcport 0.3.0` (git tag `v0.3.0`, commit
+`99c8817`) on an Intel Core Ultra 7 255U, Windows MSVC, Rust 1.97.1. They are
+a historical SDK comparison, not a rerun of 0.5.0 or 0.6.0. The root README
+previously labeled this same table as 0.4.0; that crate was never published.
+Ranges below are from three complete runner invocations:
 
 | Workload | Server | Median latency | Throughput | Versus mcport |
 | --- | --- | ---: | ---: | ---: |
@@ -94,6 +96,18 @@ latency by 6.05%. All five `tools/list` invocations improved; four of five
 
 With the shared MSVC thin-LTO release profile, binary sizes were 411,136 bytes
 for mcport, 1,440,256 bytes for rmcp, and 1,469,440 bytes for rust-mcp-sdk.
+
+## 14 September 2026 working-tree check
+
+One release-profile invocation of this 0.6.0 checkout, with the same pinned
+SDKs, still finished faster than both competitors on Windows. This is a
+single-run verification, not a replacement for the three-run July 29 table
+and not a p50 individual RTT.
+
+| Workload | Versus rmcp 0.16.0 | Versus rust-mcp-sdk 1.0.1 |
+| --- | ---: | ---: |
+| tools/list | 13.18× | 20.11× |
+| tools/call | 8.29× | 12.03× |
 
 ## Scope and limits
 

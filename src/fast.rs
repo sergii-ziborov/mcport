@@ -1,5 +1,6 @@
 use crate::{
     negotiate_protocol_version, ServerIdentity, ToolReply, ToolServer, DEFAULT_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSION,
 };
 use blazingly_json::{from_str, CanonicalScanner, JsonCursor, RawJson, Value};
 use serde::de::{Deserialize, Deserializer, Visitor};
@@ -115,6 +116,8 @@ struct Route<'a> {
     protocol_version: Option<Cow<'a, str>>,
     name: Option<Cow<'a, str>>,
     arguments: Option<RawJson<'a>>,
+    modern_version: Option<Cow<'a, str>>,
+    has_client_capabilities: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +173,8 @@ struct ServerInfo<'a> {
 #[derive(Serialize)]
 struct ToolList<'a> {
     tools: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "resultType")]
+    result_type: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -177,6 +182,8 @@ struct ToolList<'a> {
 struct ToolResult<'a> {
     content: &'a [TextContent<'a>],
     is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     structured_content: Option<&'a Value>,
 }
@@ -196,13 +203,17 @@ pub(crate) fn dispatch_line(
         write_canonical_request(server, writer, request)?;
         return Ok(true);
     }
-    if line.contains("io.modelcontextprotocol") || line.contains(r#""cursor""#) {
+    if line.contains(r#""cursor""#) {
         return dispatch_owned_line(server, line, writer);
     }
 
     let Ok(route) = parse_route(line) else {
         return dispatch_owned_line(server, line, writer);
     };
+    let modern = is_valid_modern(&route);
+    if route.modern_version.is_some() && !modern {
+        return dispatch_owned_line(server, line, writer);
+    }
     if route.jsonrpc.as_deref() != Some("2.0") {
         write_error(
             writer,
@@ -226,6 +237,7 @@ pub(crate) fn dispatch_line(
     };
 
     match method {
+        "initialize" | "ping" if modern => return dispatch_owned_line(server, line, writer),
         "initialize" => write_initialize(
             server,
             writer,
@@ -236,9 +248,16 @@ pub(crate) fn dispatch_line(
                 .unwrap_or(DEFAULT_PROTOCOL_VERSION),
         )?,
         "ping" => write_empty(writer, id)?,
-        "tools/list" => write_tools_list(server, writer, id)?,
+        "tools/list" => write_tools_list(server, writer, id, modern)?,
         "tools/call" => {
-            write_tool_call(server, writer, id, route.name.as_deref(), route.arguments)?;
+            write_tool_call(
+                server,
+                writer,
+                id,
+                route.name.as_deref(),
+                route.arguments,
+                modern,
+            )?;
         }
         _ => return dispatch_owned_line(server, line, writer),
     }
@@ -287,6 +306,22 @@ fn parse_route(line: &str) -> blazingly_json::Result<Route<'_>> {
                             }
                             "name" => name = field.deserialize::<LooseString<'_>>()?.0,
                             "arguments" => arguments = Some(field.raw()?),
+                            "_meta" => field.object(|meta| {
+                                while let Some(field) = meta.next_field()? {
+                                    match field.name() {
+                                        "io.modelcontextprotocol/protocolVersion" => {
+                                            route.modern_version =
+                                                field.deserialize::<LooseString<'_>>()?.0;
+                                        }
+                                        "io.modelcontextprotocol/clientCapabilities" => {
+                                            field.skip()?;
+                                            route.has_client_capabilities = true;
+                                        }
+                                        _ => field.skip()?,
+                                    }
+                                }
+                                Ok(())
+                            })?,
                             _ => field.skip()?,
                         }
                     }
@@ -355,12 +390,12 @@ fn write_canonical_request(
             id,
             protocol_version,
         } => write_initialize(server, writer, id, protocol_version),
-        CanonicalRequest::ToolsList(id) => write_tools_list(server, writer, id),
+        CanonicalRequest::ToolsList(id) => write_tools_list(server, writer, id, false),
         CanonicalRequest::ToolCall {
             id,
             name,
             arguments,
-        } => write_tool_call(server, writer, id, Some(name), Some(arguments)),
+        } => write_tool_call(server, writer, id, Some(name), Some(arguments), false),
     }
 }
 
@@ -418,10 +453,16 @@ fn write_initialize_with_identity(
     )
 }
 
+fn is_valid_modern(route: &Route<'_>) -> bool {
+    route.modern_version.as_deref() == Some(MODERN_PROTOCOL_VERSION)
+        && route.has_client_capabilities
+}
+
 fn write_tools_list(
     server: &mut impl ToolServer,
     writer: &mut impl Write,
     id: RequestId<'_>,
+    modern: bool,
 ) -> io::Result<()> {
     if server.catalog_is_paginated() {
         return write_first_tool_page(server, writer, id);
@@ -430,13 +471,17 @@ fn write_tools_list(
         write_response_start(writer, id)?;
         writer.write_all(br#"{"tools":"#)?;
         writer.write_all(catalog.get().as_bytes())?;
-        return finish_response(writer, b"}");
+        return if modern {
+            finish_response(writer, br#","resultType":"complete"}"#)
+        } else {
+            finish_response(writer, b"}")
+        };
     }
     if let Some(catalog) = server.catalog_ref() {
-        return write_tool_list(writer, id, catalog);
+        return write_tool_list(writer, id, catalog, modern);
     }
     let catalog = server.catalog();
-    write_tool_list(writer, id, &catalog)
+    write_tool_list(writer, id, &catalog, modern)
 }
 
 #[cold]
@@ -472,13 +517,21 @@ fn write_tool_page(
     )
 }
 
-fn write_tool_list(writer: &mut impl Write, id: RequestId<'_>, catalog: &Value) -> io::Result<()> {
+fn write_tool_list(
+    writer: &mut impl Write,
+    id: RequestId<'_>,
+    catalog: &Value,
+    modern: bool,
+) -> io::Result<()> {
     write(
         writer,
         &Response {
             jsonrpc: "2.0",
             id,
-            result: ToolList { tools: catalog },
+            result: ToolList {
+                tools: catalog,
+                result_type: modern.then_some("complete"),
+            },
         },
     )
 }
@@ -489,6 +542,7 @@ fn write_tool_call(
     id: RequestId<'_>,
     name: Option<&str>,
     arguments: Option<RawJson<'_>>,
+    modern: bool,
 ) -> io::Result<()> {
     let Some(name) = name else {
         return write_error(writer, id, -32_602, "tools/call requires params.name");
@@ -523,6 +577,7 @@ fn write_tool_call(
                     result: ToolResult {
                         content: content.as_slice(),
                         is_error: false,
+                        result_type: modern.then_some("complete"),
                         structured_content: structured.then_some(&value),
                     },
                 },
@@ -544,15 +599,35 @@ fn write_tool_call(
                 writer.write_all(br#","structuredContent":"#)?;
                 writer.write_all(value.get().as_bytes())?;
             }
-            finish_response(writer, b"}")
+            finish_tool_result(writer, modern)
         }
         ToolReply::StructuredAny { value } => {
             write_response_start(writer, id)?;
             writer.write_all(br#"{"content":[{"type":"text","text":"#)?;
             blazingly_json::to_writer(&mut *writer, &value.get())?;
             writer.write_all(br#"}],"isError":false"#)?;
-            finish_response(writer, b"}")
+            if modern {
+                writer.write_all(br#","structuredContent":"#)?;
+                writer.write_all(value.get().as_bytes())?;
+            }
+            finish_tool_result(writer, modern)
         }
+        ToolReply::Literal { text } => write(
+            writer,
+            &Response {
+                jsonrpc: "2.0",
+                id,
+                result: ToolResult {
+                    content: &[TextContent {
+                        r#type: "text",
+                        text: &text,
+                    }],
+                    is_error: false,
+                    result_type: modern.then_some("complete"),
+                    structured_content: None,
+                },
+            },
+        ),
         ToolReply::Error(message) => write(
             writer,
             &Response {
@@ -564,6 +639,7 @@ fn write_tool_call(
                         text: &message,
                     }],
                     is_error: true,
+                    result_type: modern.then_some("complete"),
                     structured_content: None,
                 },
             },
@@ -606,6 +682,14 @@ fn finish_response(writer: &mut impl Write, result_suffix: &[u8]) -> io::Result<
     writer.write_all(result_suffix)?;
     writer.write_all(b"}\n")?;
     writer.flush()
+}
+
+fn finish_tool_result(writer: &mut impl Write, modern: bool) -> io::Result<()> {
+    if modern {
+        finish_response(writer, br#","resultType":"complete"}"#)
+    } else {
+        finish_response(writer, b"}")
+    }
 }
 
 #[cfg(test)]

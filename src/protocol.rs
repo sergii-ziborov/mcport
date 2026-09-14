@@ -101,6 +101,18 @@ pub fn tool_success_raw_any(id: &Value, value: &RawValue) -> Value {
     success(id, &result)
 }
 
+/// A successful `tools/call` result whose text block is a literal string.
+#[must_use]
+pub fn tool_literal_text(id: &Value, text: impl Into<String>) -> Value {
+    success(
+        id,
+        &json!({
+            "content": [{"type": "text", "text": text.into()}],
+            "isError": false
+        }),
+    )
+}
+
 /// A failed `tools/call` result. Tool failures are content-level errors, not
 /// JSON-RPC protocol errors, so agents can read and react to them.
 #[must_use]
@@ -141,6 +153,9 @@ mod tests {
 
         let failed = super::tool_error(&json!(4), "boom");
         assert_eq!(failed["result"]["isError"], true);
+
+        let literal = super::tool_literal_text(&json!(6), "hello");
+        assert_eq!(literal["result"]["content"][0]["text"], "hello");
 
         let protocol = super::error(&json!(5), -32_601, "method not found: x");
         assert_eq!(protocol["error"]["code"], -32_601);

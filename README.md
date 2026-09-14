@@ -1,567 +1,295 @@
 # mcport
 
-Fast, bounded, Tokio-free MCP stdio for Rust.
+**Faster than every SDK in our published stdio comparison. No Tokio.**
 
-`mcport` is a small server runtime for applications that need MCP tools without
-bringing an async executor into the process. It combines a compact builder API,
-typed and raw tool handlers, a lower-level trait, zero-copy request routing,
-canonical control-message recognition, direct response serialization, and an
-optional controlled scheduler for expensive handlers.
+A small Rust MCP server runtime for local tools and existing synchronous
+applications. Ordinary Rust functions become MCP tools — without handwritten
+JSON wrapping, without Tokio, and without extra work on every call.
 
-The `mcport` crate contains no Tokio, Hyper, Axum, futures executor, or unsafe
-code.
+The recorded comparison covers rmcp 0.16.0 and rust-mcp-sdk 1.0.1 on a
+specific tools-only Windows stdio workload. It is not a measurement of every
+SDK, transport, platform, or execution mode. See [Performance](#performance)
+for versions, platform, and method.
 
-## Install
+## Start with a working project
 
-Published stable release:
+MCPort is a library. Add it to the Rust binary that will serve your tools.
 
-```toml
-[dependencies]
-mcport = "0.4.0"
+```text
+cargo new my-mcp-server
+cd my-mcp-server
+cargo add mcport@0.6.0
+cargo add serde --features derive
 ```
 
-Or run `cargo add mcport@0.4.0`.
+The core crate declares Rust 1.78 as its minimum supported version. The
+default `macros` feature is compile-time only: it does not add Tokio, Hyper,
+Axum, or `serde_json`.
 
-`mcport` uses `blazingly-json` for its public `Value`, `RawJson`, `RawValue`,
-and `json!` surface. Applications can import those types from `mcport` and do
-not need a second direct JSON dependency for MCP handling.
+Replace `src/main.rs` with:
+
+```rust
+use mcport::{tool, tools, McpServer};
+
+/// Adds two integers.
+#[tool]
+fn add(left: i32, right: i32) -> i64 {
+    i64::from(left) + i64::from(right)
+}
+
+fn main() -> std::io::Result<()> {
+    McpServer::new("math", env!("CARGO_PKG_VERSION"))
+        .tools(tools![add])
+        .serve()
+}
+```
+
+`add(2, 3)` remains an ordinary Rust call. The attribute adds metadata and an
+adapter; it does not turn the function into an object you cannot use outside
+MCP. The existing `.tool(name, description, schema, handler)` path is
+unchanged.
+
+The same server lives in [`examples/math.rs`](examples/math.rs). A handwritten
+typed handler, without the macro, is [`examples/typed_manual.rs`](examples/typed_manual.rs).
+
+Build and run your server:
+
+```text
+cargo build --release
+```
+
+Configure your MCP client's stdio integration with the absolute path to your
+application's executable, not a command named `mcport`:
+
+```text
+/path/to/my-mcp-server/target/release/my-mcp-server
+```
+
+On Windows the executable has the `.exe` suffix. A server waiting for stdin
+normally prints nothing. Logging and diagnostics belong on stderr; stdout is
+reserved for MCP frames. Keep process arguments separate from the executable
+path in the client's configuration.
+
+A manual legacy conversation consists of one JSON object per line:
+
+```text
+{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"manual-test","version":"1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"left":2,"right":3}}}
+```
+
+The `add` result contains `structuredContent`: `{"result":5}`. There is no
+response to the `initialized` notification.
+
+## Choose the execution mode
+
+| Need | Start here | Important boundary |
+| --- | --- | --- |
+| Small synchronous tools, mutable application state, minimum overhead | `McpServer` | Handlers run inline; a slow handler blocks further input processing. |
+| Bounded parallel handlers, cooperative cancellation, deadlines, progress | `ConcurrentMcpServer` + `RuntimeConfig` | Cancellation is cooperative. Arbitrary Rust threads cannot safely be forcibly killed. |
+| An application that already owns framing or transport | `ToolServer` + `serve_message` | The embedding transport must enforce framing, byte limits, flushing and shutdown. |
+
+Do not choose controlled execution just to get typed arguments: the inline
+builder already supports `#[tool]`, `typed_tool`, and `raw_tool`.
+
+## Existing applications do not need a new JSON engine everywhere
+
+Use your existing Serde models at the MCP boundary. A handler can deserialize
+into your input structure and pass a serializable output to
+`ToolReply::structured`. Your other dependencies may continue using their own
+`serde_json::Value` types.
+
+Use `raw_tool` when your application needs its own decoding or direct access
+to validated JSON. This avoids forcing a full application-wide migration to
+MCPort's public `Value` type.
+
+The optional migration technique of aliasing the `serde_json` dependency name
+to `blazingly-json` is a separate, advanced change. It must not be confused
+with mandatory installation of MCPort, nor with guaranteed type identity
+across other libraries' APIs.
+
+## State and startup work
+
+`McpServer::with_state` and the `*_with_state` registration methods share
+mutable state between inline calls. The controlled runtime requires an
+explicit thread-safe state model.
+
+A cheap identity/catalog lets discovery avoid expensive tool work. It does
+not defer work your program has already executed while constructing state:
+`with_state(..., load_index())` still calls `load_index()` first. Use an
+explicit lazy state holder when loading belongs on the first tool call. See
+[`examples/lazy_state.rs`](examples/lazy_state.rs).
+
+To add `--mcp` to an existing CLI and keep the same functions callable from
+the command line, see [`examples/embed_cli.rs`](examples/embed_cli.rs).
+
+## Results and errors
+
+| API | Result |
+| --- | --- |
+| `String` / `&'static str` from `#[tool]` | Literal text block, no extra JSON-quote layer |
+| number / `bool` / `Vec<T>` from `#[tool]` | Stable object wrapper `{"result": ...}` |
+| struct with `#[derive(ToolOutput)]` | Object result + `structuredContent` |
+| `Result<T, ToolError>` | Success `T` or a tool-level failure; not `{ "Ok": ... }` |
+| `Json<T>` | Explicit JSON mode for a `Serialize` value |
+| `ToolReply::structured(value)` | Object results include text plus `structuredContent` |
+| `ToolReply::structured_only(value)` | Object results omit the text mirror. Use only with a client known to read structured content. |
+| `ToolReply::text(value)` | Serializes the value as JSON and puts that JSON representation in a text block. It is **not** a literal-text constructor. |
+| `ToolReply::literal_text(text)` | Literal text block. Additive; does not change `text()`. |
+| `ToolReply::error(message)` | A tool-level result with `isError: true`, not a JSON-RPC transport error. |
+
+`ToolReply::text("hello")` produces text containing the JSON representation
+`"hello"`, including its JSON string quotes. Do not assume literal string
+semantics.
+
+Text mirroring is the default compatibility behavior. Removing it can
+substantially reduce wire bytes, but does not establish any particular
+reduction in the model's input tokens. Some clients ignore
+`structuredContent`; they would see an empty result for structured-only
+object output.
+
+The non-object `StructuredAny` path does not preserve an independently
+chosen payload policy. Test arrays/scalars and the exact client/protocol
+combination before relying on structured-only output there. Native modern
+non-object output is an explicit path, not a silent shape change.
+
+## Schema checks
+
+Generated `#[tool]` schemas use `additionalProperties: false` and apply
+`default` / `min` / `max` both in the advertised schema and in the adapter.
+A missing `limit` with `default = 20` becomes 20. A sent `null` is not
+treated as a missing field.
+
+`strict_schemas()` turns recorded description defects into startup errors. It
+does not constitute full JSON Schema validation or proof that a handwritten
+schema matches a Rust type. The current lint has known coverage limits around
+composition/reference keywords. Treat improvements to the lint as correctness
+work, not as a reason to advertise broader guarantees.
+
+`read_only` and `closed_world` are advertised hints. They do not sandbox the
+function. MCP also requires clients to treat tool annotations as untrusted
+when the server is untrusted.
+
+## Protocol and scope
+
+The crate implements the tools-oriented server surface for legacy
+initialization (`2025-06-18`, `2025-11-25`) and a modern per-request protocol
+path (`2026-07-28`). Modern structured results can carry non-object JSON;
+legacy non-object results use the text compatibility path. Valid modern
+`tools/list` and `tools/call` requests keep borrowed routing; they no longer
+fall back to a full owned request DOM only because `_meta` is present.
+
+Runtime-neutral extension hooks exist for additional methods and capability
+composition. Resources/prompts are not automatically exposed through a full
+high-level builder API.
+
+There is no built-in remote HTTP transport, OAuth service, production client,
+browser dashboard or arbitrary-code sandbox. These are not pulled into the
+default runtime dependency graph.
+
+## Bounds and cancellation
+
+The standard stream adapters bound input/output messages and construct
+responses atomically rather than emitting a truncated JSON document after a
+response-size overflow. Defaults are 8 MiB per request and response.
+
+| Bound | What it limits | What it does not limit |
+| --- | --- | --- |
+| Request/response bytes | One MCP frame | Process RSS, handler allocations, intermediate `Value`s |
+| Controlled queue depths | Waiting jobs and output frames | A blocked writer, or shutdown time |
+| `max_in_flight` | Concurrent handler slots | A timed-out handler that ignores cancellation still occupies its slot until it exits |
+
+`FlushPolicy::PerMessage` is the interactive default. Count-only batching can
+stall a client that sends one request and waits for its reply.
 
 ## Performance
 
-The table below records the published `0.1.0` baseline on an Intel Core Ultra 7
-255U running Windows. These are ranges
-across three complete release-profile runs; each run alternates implementation
-order for 24 rounds and reports the median. Both paths use the same
-`blazingly-json` engine, so the difference measures runtime architecture rather
-than a parser swap. Absolute latency varied with system load, while the
-relative advantage remained stable.
+MCPort spends less work on local MCP requests: no mandatory async executor,
+borrowed request routing, typed/raw/`#[tool]` handlers, a catalog serialized
+once after registration, and direct response serialization on its optimized
+path.
 
-| Complete request/response | Direct mcport | Original owned-DOM path | Speedup |
-| --- | ---: | ---: | ---: |
-| ping | 23.55-27.55 ns | 707.21-863.02 ns | 29.65-34.41x |
-| initialize | 402.84-531.14 ns | 4,565.21-5,119.87 ns | 9.19-12.49x |
-| tools/list | 2,128.22-2,736.24 ns | 7,877.45-9,916.41 ns | 3.62-3.78x |
-| tools/call | 2,150.33-2,332.38 ns | 8,409.90-8,739.66 ns | 3.66-3.97x |
+Two kinds of comparison must remain separate:
 
-A typed builder handler was another 1.31-1.35x faster than the already-fast
-`Value` handler for the measured tool call.
+- **Internal fast path vs owned DOM:** both implementations use MCPort and
+  the same JSON engine. These numbers measure architectural changes within
+  the runtime, not the removal of Tokio.
+- **SDK comparison:** complete server binaries exchanging messages over real
+  stdin/stdout pipes. These include runtime, codec, dispatch, handler, OS
+  pipe and process startup costs.
 
-The `0.4.0` work keeps `serve_message` as the canonical fast path. New modern
-protocol fallbacks and pagination are placed on cold paths. The black-box
-runner can also compare a current binary against an exact baseline binary in
-alternating pairs and fail on a configured latency regression; see
-`benchmarks/competitors/README.md`.
+### Recorded SDK comparison
 
-### Full-process competitor benchmark
+These historical numbers are for **published mcport 0.3.0** (tag `v0.3.0`,
+commit `99c8817`, 29 July 2026) on Intel Core Ultra 7 255U / Windows MSVC /
+Rust 1.97.1, against rmcp 0.16.0 and rust-mcp-sdk 1.0.1. They are **not** a
+new measurement of 0.5.0 or 0.6.0. The same table was previously mislabeled
+`0.4.0` in this README; `0.4.0` was never published to crates.io.
 
-The committed black-box harness also compares complete release binaries over
-real stdin/stdout pipes. The table uses `mcport 0.4.0`, the official Rust SDK
-`rmcp 0.16.0`, and `rust-mcp-sdk 1.0.1`. Each server receives an initialize
-handshake followed by 10,000 uniquely identified requests. Every complete run
-warms each binary once, rotates server order across five measured rounds, and
-reports the median.
+The runner reports the median total time of a pipelined series divided by
+10,000. This is amortized time per request, not a p50 individual round-trip
+latency.
 
-These are ranges across three complete runs on the same Windows machine:
+| Workload | Compared SDK | Recorded slowdown relative to MCPort |
+| --- | --- | ---: |
+| tools/list | rmcp 0.16.0 | 16.97–23.89× |
+| tools/list | rust-mcp-sdk 1.0.1 | 24.78–28.31× |
+| tools/call | rmcp 0.16.0 | 8.92–11.44× |
+| tools/call | rust-mcp-sdk 1.0.1 | 13.15–16.42× |
 
-| Workload | Server | Median latency | Throughput | Versus mcport |
-| --- | --- | ---: | ---: | ---: |
-| tools/list | mcport | 5.41-9.13 us | 109,473-184,988 req/s | 1.00x |
-| tools/list | rmcp 0.16.0 | 91.72-218.26 us | 4,582-10,903 req/s | 16.97-23.89x slower |
-| tools/list | rust-mcp-sdk 1.0.1 | 133.98-253.22 us | 3,949-7,464 req/s | 24.78-28.31x slower |
-| tools/call | mcport | 7.39-9.88 us | 101,233-135,296 req/s | 1.00x |
-| tools/call | rmcp 0.16.0 | 82.31-112.96 us | 8,853-12,149 req/s | 8.92-11.44x slower |
-| tools/call | rust-mcp-sdk 1.0.1 | 121.31-152.15 us | 6,573-8,243 req/s | 13.15-16.42x slower |
-
-The harness validates the final response from every warmup: `tools/list` must
-contain `query_graph`, while `tools/call` must reproduce all four structured
-fields. It also rejects any protocol error and requires exactly 10,001
-responses per process. `tools/list` emits the same 288.9 average bytes per
-response in all three implementations. For `tools/call`, mcport and rmcp emit
-259.9 bytes while rust-mcp-sdk emits 243.9 bytes; mcport is not winning by
-omitting the explicit `isError: false` field.
-
-With identical thin-LTO release settings, the benchmark binaries are:
-
-| Binary | Size |
-| --- | ---: |
-| mcport | 411,136 bytes |
-| rmcp 0.16.0 | 1,440,256 bytes |
-| rust-mcp-sdk 1.0.1 | 1,469,440 bytes |
-
-The competitor SDKs intentionally live only in
-`benchmarks/competitors`, which the published crate excludes. Their Tokio and
-`serde_json` dependencies never enter mcport's normal dependency graph.
-
-Run the black-box harness:
+Reproduce the checked-in harness from a repository checkout:
 
 ```text
-cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
+cargo build --locked --manifest-path benchmarks/competitors/Cargo.toml --release --bins
 benchmarks/competitors/target/release/bench-runner
 ```
 
-This is a selected local tools-only stdio workload, not a claim that mcport
-implements the broader feature sets of either SDK. The benchmark includes
-process startup, OS pipes, each runtime and codec, dispatch, handler work, and
-complete response output.
+On Windows append `.exe` to the runner. The competitor workspace is excluded
+from the published crate and does not become a dependency of your
+application. Full method, binary sizes, and scope:
+[`benchmarks/competitors/README.md`](benchmarks/competitors/README.md).
 
-### What the benchmark measures
+### Internal fast path
 
-`benches/runtime.rs` exercises a complete in-memory request/response cycle:
-
-1. accept one UTF-8 JSON-RPC message;
-2. recognize or parse the route;
-3. negotiate/list/dispatch as appropriate;
-4. deserialize tool arguments;
-5. execute the same deterministic handler;
-6. construct and serialize the complete MCP response plus newline.
-
-The `direct` side calls `serve_message`. The comparison side first parses the
-whole request into an owned `Value`, calls the public `dispatch` compatibility
-API, then serializes that owned response. Before timing begins, the harness
-parses both responses and asserts semantic equality.
-
-Each row uses 25,000 operations per round and 24 alternating rounds. The table
-reports ranges of the per-run medians from three complete runs. Output is a
-preallocated `Vec<u8>`, so the numbers isolate runtime/codec cost; they do not
-claim filesystem, process scheduling, pipe, client, or actual tool-work
-latency. Run the benchmark on the deployment machine before using absolute
-nanoseconds for capacity planning.
-
-Why the direct path wins:
-
-- compact `ping`, `initialize`, `tools/list`, and `tools/call` share one exact
-  zero-allocation recognizer that parses the common prefix and request id once;
-- reordered, spaced, or escaped input falls back to the strict
-  order-independent `JsonCursor`;
-- routing fields and raw tool arguments borrow from the input line;
-- typed/raw handlers skip an intermediate mutable JSON DOM;
-- `ToolReply::structured` serializes an arbitrary Serde result once into a
-  `RawValue`, then reuses the same bytes for text and `structuredContent`;
-- canonical response envelopes are written directly;
-- the builder lends its identity and validated pre-serialized catalog instead
-  of cloning or repeatedly serializing them;
-- the stdio loop reuses one input buffer for the full session;
-- structurally unusual but valid legacy requests fall back to the public
-  owned dispatcher, preserving response semantics.
-
-Run the committed harness:
-
-```text
-cargo bench --bench runtime
-```
-
-For a stable comparison, use a release build, close CPU-heavy work, run the
-harness several times, and compare the ratio as well as absolute latency.
-
-## Minimal server
-
-```rust
-use mcport::{json, McpServer, ToolReply};
-
-fn main() -> std::io::Result<()> {
-    let mut server = McpServer::new("echo", "1.0.0")
-        .instructions("Echoes tool arguments back.")
-        .tool(
-            "echo",
-            "Echo the arguments.",
-            json!({
-                "type": "object",
-                "description": "Any caller-defined object; every key is echoed.",
-                "additionalProperties": true
-            }),
-            ToolReply::structured,
-        );
-
-    server.serve()
-}
-```
-
-`McpServer` is the smallest mode: one request is dispatched inline at a time.
-Its stdio adapter still enforces bounded input and atomic bounded output, with
-8 MiB request and response defaults. Use `serve_with_limits` to choose lower
-budgets. Oversized input is drained through the next newline; oversized output
-is replaced by one valid JSON-RPC error rather than truncated bytes.
-`FlushPolicy::PerMessage` is the interactive default. Throughput-oriented
-adapters may opt into `FlushPolicy::Batch { max_messages }` through
-`TransportConfig` and `serve_with_config`; a partial final batch is always
-flushed at EOF. Batching deliberately trades response latency for fewer flush
-boundaries.
-
-## Controlled runtime
-
-Use `ConcurrentMcpServer` when tools can be slow, parallel, cancellable, or
-untrusted enough to require scheduling policy:
-
-```rust
-use mcport::{
-    json, ConcurrentMcpServer, FlushPolicy, RuntimeConfig, ToolReply,
-    TransportLimits,
-};
-use std::time::Duration;
-
-fn main() -> std::io::Result<()> {
-    let config = RuntimeConfig {
-        transport: TransportLimits::new(1024 * 1024, 1024 * 1024),
-        max_in_flight: 4,
-        queue_depth: 32,
-        output_queue_depth: 32,
-        output_flush_policy: FlushPolicy::PerMessage,
-        handler_deadline: Some(Duration::from_secs(10)),
-    };
-
-    ConcurrentMcpServer::new("worker", "1.0.0")
-        .tool(
-            "work",
-            "Runs bounded cooperative work.",
-            json!({
-                "type": "object",
-                "properties": {"steps": {"type": "integer"}},
-                "required": ["steps"]
-            }),
-            |context, arguments| {
-                if context.is_cancelled() {
-                    return ToolReply::error("cancelled");
-                }
-                let _ = context.report_progress(1.0, Some(1.0), Some("done"));
-                ToolReply::structured(arguments)
-            },
-        )
-        .serve(config)
-}
-```
-
-This mode provides a fixed handler-slot ceiling, bounded request and output
-queues, deadlines, per-request cancellation tokens, panic-to-protocol-error
-isolation, and a bounded progress channel. Client cancellation is cooperative:
-handlers must observe `RequestContext::is_cancelled` or its token. A handler
-that ignores cancellation cannot be forcibly killed safely by a Rust thread;
-its slot remains occupied until it exits, preventing detached runaway work
-from creating unbounded concurrency. Hard termination belongs in a separate
-process or another isolation boundary. Panic isolation applies when the binary
-uses unwinding; `panic = "abort"` still terminates the process.
-
-## Typed tool
-
-Typed handlers deserialize their arguments directly from validated raw JSON.
-They do not construct an intermediate `Value`.
-
-```rust
-use mcport::{json, McpServer, ToolReply};
-use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize)]
-struct Add {
-    left: i64,
-    right: i64,
-}
-
-#[derive(Serialize)]
-struct Sum {
-    value: i64,
-}
-
-let server = McpServer::new("math", "1.0.0").typed_tool(
-    "add",
-    "Adds two integers.",
-    json!({
-        "type": "object",
-        "properties": {
-            "left": {"type": "integer"},
-            "right": {"type": "integer"}
-        },
-        "required": ["left", "right"]
-    }),
-    |arguments: Add| {
-        ToolReply::structured(Sum {
-            value: arguments.left + arguments.right,
-        })
-    },
-);
-# let _ = server;
-```
-
-Use `raw_tool` when a handler already has its own codec or wants exact access
-to the validated argument JSON.
-
-## Shared state
-
-```rust
-use mcport::{json, McpServer, ToolReply};
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct Increment {
-    amount: u64,
-}
-
-let server = McpServer::with_state("counter", "1.0.0", 0_u64)
-    .typed_tool_with_state(
-        "increment",
-        "Increments the counter.",
-        json!({
-            "type": "object",
-            "properties": {"amount": {"type": "integer"}},
-            "required": ["amount"]
-        }),
-        |counter, arguments: Increment| {
-            *counter += arguments.amount;
-            ToolReply::structured(json!({"count": *counter}))
-        },
-    );
-# let _ = server;
-```
-
-## Schema honesty
-
-A client can only learn what a tool accepts from the schema in `tools/list`. A
-property advertised as a bare `{"type": "object"}` says nothing, so the caller
-discovers the real keys one rejected call at a time: a full round trip per
-missing field, with no way to distinguish an incomplete schema from wrong
-arguments. `mcport` checks for that shape where tools are registered rather
-than leaving it to each server's tests.
-
-Recursively, for every node with an explicit `type`:
-
-- `"type": "object"` must describe what it accepts, by carrying `properties`,
-  by giving `additionalProperties` a schema, or by declaring itself free-form
-  with a `description` and `additionalProperties: true`;
-- `"type": "array"` must carry `items`.
-
-Genuinely open-ended passthrough arguments stay legal - their keys are defined
-by another system and cannot be enumerated - but a deliberate decision must not
-look identical to silence. A tool that takes no arguments says so with
-`"properties": {}`.
-
-```rust
-use mcport::{json, McpServer, ToolReply};
-
-let server = McpServer::new("planner", "1.0.0")
-    .strict_schemas()
-    .tool(
-        "plan",
-        "Plans work under a budget.",
-        json!({
-            "type": "object",
-            "properties": {
-                "budget": {
-                    "type": "object",
-                    "properties": {"ceiling_cents": {"type": "integer"}},
-                    "required": ["ceiling_cents"]
-                }
-            },
-            "required": ["budget"]
-        }),
-        ToolReply::structured,
-    );
-assert!(server.schema_defects().is_empty());
-# let _ = server;
-```
-
-Both builders record defects at registration and expose them through
-`schema_defects()`, whether or not strict mode is on, so a server can assert on
-them in its own tests. Registration itself stays infallible, so no existing
-builder chain breaks. `strict_schemas()` is the opt-in that turns the defects
-into a startup failure: the `serve*` methods return an `InvalidInput` error
-listing every defect before the first request is read, and
-`serve_controlled_streams` does the same before any worker starts. Servers that
-implement `ToolServer` or `ConcurrentToolServer` by hand can call
-`validate_tool_schema` on their own catalog.
-
-## Custom static dispatch
-
-The original three-method trait remains available for applications that prefer
-compile-time dispatch or generate their own catalog.
-
-```rust
-use mcport::{json, ServerIdentity, ToolReply, ToolServer, Value};
-
-struct Echo;
-
-impl ToolServer for Echo {
-    fn identity(&self) -> ServerIdentity {
-        ServerIdentity::new("echo", "1.0.0", "Echoes arguments.")
-    }
-
-    fn catalog(&mut self) -> Value {
-        json!([{
-            "name": "echo",
-            "description": "Echo.",
-            "inputSchema": {
-                "type": "object",
-                "description": "Any caller-defined object; every key is echoed.",
-                "additionalProperties": true
-            }
-        }])
-    }
-
-    fn call(&mut self, name: &str, arguments: Value) -> ToolReply {
-        match name {
-            "echo" => ToolReply::structured(arguments),
-            _ => ToolReply::error(format!("unknown tool: {name}")),
-        }
-    }
-}
-```
-
-`ToolServer::call_raw`, identity/catalog borrowing, and pagination methods have
-compatible defaults. Existing implementations do not need to define them;
-optimized implementations can override them. Both builders expose
-`tool_page_size` for opaque cursor pagination.
-
-## Embedding
-
-- `serve(&mut server)` owns the bounded blocking stdin/stdout loop;
-- `serve_with_limits` sets explicit request and response byte budgets;
-- `serve_with_config` additionally selects per-message or batched flushing;
-- `serve_streams` and `serve_streams_with_limits` accept injectable streams;
-- `serve_message` processes one newline-free message and reports whether it
-  wrote a response; framing and byte budgets remain the embedding transport's
-  responsibility;
-- `serve_controlled` and `serve_controlled_streams` run a thread-safe
-  `ConcurrentToolServer` under `RuntimeConfig`;
-- `dispatch` retains the owned `Value` API for compatibility and testing.
-
-## Protocol contract
-
-| Input | Result |
-| --- | --- |
-| valid request with `id` | one newline-terminated JSON-RPC response |
-| valid notification without `id` | no response |
-| malformed JSON | `-32700` parse error |
-| malformed JSON-RPC request/version | `-32600` invalid request |
-| unsupported method | `-32601` method not found |
-| missing/unknown tool | `-32602` invalid params |
-| registered handler failure | successful JSON-RPC envelope with MCP `isError: true` |
-| request over `max_request_bytes` | bounded `-32000` error; frame is drained |
-| response over `max_response_bytes` | atomic `-32000` error, never partial JSON |
-
-The fast recognizers accept only complete canonical layouts. They do not
-partially trust lookalike input: reordered fields, whitespace variants, escaped
-names, unusual request IDs, and other valid layouts fall back to the strict
-order-independent `JsonCursor`; malformed inputs fall back far enough to produce
-the same JSON-RPC semantics as `dispatch`.
-
-`ToolReply::structured` accepts any `serde::Serialize` result. It serializes
-once into a validated `RawValue`. Object roots are emitted both as compact text
-and zero-copy `structuredContent` in every supported revision. MCP 2026-07-28
-also permits arrays, scalars, and null as `structuredContent`; legacy responses
-keep those values text-only.
-
-## Runtime behavior
-
-- supports legacy `initialize`, `ping`, `tools/list`, and `tools/call`;
-- supports stateless MCP `2026-07-28` `server/discover` and per-request protocol
-  metadata while retaining `2025-11-25` and `2025-06-18` compatibility;
-- strips UTF-8 BOMs from Windows-oriented input;
-- rejects invalid UTF-8, incomplete EOF frames, and oversized lines without
-  unbounded line allocation;
-- consumes notifications without replies;
-- returns JSON-RPC errors without terminating the stream;
-- supports opaque cursor pagination for `tools/list`;
-- checks every advertised tool schema at registration and, under
-  `strict_schemas`, refuses to serve a catalog that does not describe what its
-  tools accept;
-- lets servers compose initialization/discovery capabilities and handle
-  runtime-neutral JSON-RPC extensions such as `resources/list`,
-  `resources/templates/list`, and `resources/read`;
-- reports unknown tools as protocol errors and handler failures as MCP content
-  errors with `isError: true`;
-- mirrors object-shaped output into `structuredContent`; scalar and array
-  results remain valid text-only results;
-- defers application startup work until the first tool call if the catalog is
-  cheap or prebuilt.
-
-## Scope
-
-The `0.4.0` runtime remains server-only and stdio-only. It covers
-bounded framing/output, controlled concurrency, queue backpressure, handler
-deadlines, cooperative cancellation, progress, panic isolation, and tool
-pagination. The core owns the tools protocol and exposes capability composition
-plus a typed `MethodReply` extension hook for resources and other
-runtime-neutral request families. It does not prescribe resource storage or
-implement prompts, roots, sampling, completions, subscriptions, tasks, OAuth,
-or remote HTTP transports.
-
-Those capabilities should grow as runtime-neutral protocol layers with
-separate transport adapters. The blocking stdio default must remain Tokio-free;
-an optional remote adapter must not pull an executor into the core.
-
-This makes `mcport` narrower than the official Rust MCP SDK and
-`rust-mcp-sdk`, but substantially smaller and faster for its selected local
-tool-server workload.
+`benches/runtime.rs` compares `serve_message` with an owned-DOM `dispatch`
+loop. Both sides use `blazingly-json`. The published `0.1.0` baseline on the
+same Windows machine was 8.9–12.5× for `initialize` and 3.6–4.0× for
+`tools/call`. Run `cargo bench --bench runtime` on the deployment machine
+before using absolute nanoseconds for capacity planning.
 
 ## Dependencies and safety
 
-Direct runtime dependencies:
+Normal direct runtime dependencies are `blazingly-json` and `serde`. The
+optional `macros` feature adds `mcport-macros` at compile time only. An
+optional Schemars bridge is not included: Schemars 1.2.2 depends on
+`serde_json` even with default features off.
 
-- `blazingly-json` for JSON, borrowed routing, and canonical recognition;
-- `serde` for typed handlers and direct response serialization.
-
-`unsafe_code` is forbidden in `mcport`. Its `blazingly-json` dependency keeps
-its small audited unsafe allowance isolated to `raw_value.rs`. Tokio, Hyper,
-Axum, and `serde_json` are absent from the normal dependency tree.
-
-The two direct runtime dependencies are:
-
-- `blazingly-json = 0.1.0`;
-- `serde`, with derive support for typed handlers and response structs.
-
-There are no default-feature switches that silently add a network stack or
-executor.
-
-## Migrating an existing MCP server
-
-The published registry dependency is:
-
-```toml
-mcport = "0.4.0"
-```
-
-For code still importing `serde_json` everywhere, migration can be staged by
-aliasing only the package name first:
-
-```toml
-serde_json = { package = "blazingly-json", version = "0.1.0" }
-```
-
-That preserves existing `serde_json::Value`, `json!`, `from_*`, and `to_*`
-paths while moving them to the new engine. A full `weavatrix-rust
---all-features` consumer probe with this alias and the released mcport source
-passes 32 tests. This is compatibility evidence, not an automatic edit of the
-consumer repository.
+The MCPort crate forbids `unsafe` code; this is a property of MCPort itself,
+not a claim that every transitive dependency has no unsafe code.
 
 ## Verification
 
 ```text
 cargo fmt --all -- --check
-cargo test --locked
+cargo test --locked --all-features
 cargo test --locked --features subprocess-tests --test stdio_subprocess
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo +1.78 build --locked
-cargo bench --bench runtime
-cargo build --manifest-path benchmarks/competitors/Cargo.toml --release --bins
-benchmarks/competitors/target/release/bench-runner
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.78 build --locked --all-features
 ```
 
-The feature-gated subprocess suite exercises real pipes, fragmented input,
-partial EOF, invalid UTF-8, oversized frames, slow readers, cancellation,
-progress, panic isolation, response overflow, and repeated sessions. CI runs
-it on Linux, Windows, and macOS in addition to the Rust 1.78 build.
+The repository has Linux, Windows and macOS CI and subprocess tests. That
+does not replace testing your own handlers, client integration or
+platform-specific shutdown behavior.
 
-An Inspector smoke test can target the fixture without adding Inspector to the
-runtime dependency graph:
+An Inspector smoke test should target **your** binary, not the repository
+fixture:
 
 ```text
-cargo build --features subprocess-tests --bin mcport-test-server
+cargo build --release --example math
 npx -y @modelcontextprotocol/inspector@latest --cli \
-  target/debug/mcport-test-server --method tools/list
+  target/release/examples/math --method tools/list
 ```
-
-## Release
-
-Published: `mcport 0.4.0` is available from crates.io and can be installed with
-`cargo add mcport@0.4.0`. Earlier releases remain available for applications
-that only need the original inline server surface.
 
 ## License
 

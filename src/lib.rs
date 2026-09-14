@@ -7,27 +7,26 @@
 //! worker threads and one ordered writer. The protocol path uses
 //! `blazingly-json` without Tokio, Hyper, or Axum.
 //!
-//! Small servers can register tools directly:
+//! Ordinary Rust functions become tools without a Tokio runtime:
 //!
 //! ```no_run
-//! use mcport::{json, McpServer, ToolReply};
+//! use mcport::{tool, tools, McpServer};
+//!
+//! /// Echoes the provided text.
+//! #[tool]
+//! fn echo(text: String) -> String {
+//!     text
+//! }
 //!
 //! fn main() -> std::io::Result<()> {
-//!     let mut server = McpServer::new("echo", "1.0.0")
-//!         .instructions("Echoes tool arguments back.")
-//!         .tool(
-//!             "echo",
-//!             "Echo the arguments.",
-//!             json!({
-//!                 "type": "object",
-//!                 "description": "Any caller-defined object; every key is echoed.",
-//!                 "additionalProperties": true
-//!             }),
-//!             ToolReply::structured,
-//!         );
-//!     server.serve()
+//!     McpServer::new("echo", env!("CARGO_PKG_VERSION"))
+//!         .tools(tools![echo])
+//!         .serve()
 //! }
 //! ```
+//!
+//! The original [`typed_tool`](McpServer::typed_tool) and [`tool`](McpServer::tool)
+//! methods remain for handwritten schemas and raw JSON handlers.
 //!
 //! Implement [`ToolServer`] when dispatch needs a fully custom static surface:
 //!
@@ -86,6 +85,7 @@ mod controlled;
 mod fast;
 pub mod protocol;
 mod schema;
+mod tool;
 mod transport;
 
 pub use blazingly_json::{json, Map, RawJson, RawValue, Value};
@@ -95,7 +95,20 @@ pub use controlled::{
     ConcurrentToolServer, RequestContext, RuntimeConfig,
 };
 pub use schema::{validate_tool_schema, SchemaDefect, SchemaDefectKind};
+pub use tool::{
+    decorate_schema, object_schema, IntoToolReply, Json, PreparedTool, ToolAnnotations,
+    ToolDefinition, ToolError, ToolSchema,
+};
 pub use transport::{FlushPolicy, TransportConfig, TransportLimits};
+
+#[cfg(feature = "macros")]
+pub use mcport_macros::{tool, tools, ToolOutput, ToolSchema};
+
+/// Helpers used by generated `#[tool]` adapters. Not a public contract.
+#[doc(hidden)]
+pub mod __private {
+    pub use blazingly_json::{from_str, to_value};
+}
 
 use serde::Serialize;
 use std::io::{self, BufRead, Write};
@@ -217,6 +230,11 @@ pub enum ToolReply {
     },
     /// Tool failure reported as `isError: true` content, not a protocol error.
     Error(String),
+    /// Literal text content. The string is the text block, not JSON-encoded again.
+    Literal {
+        /// Characters that appear in the MCP text content block.
+        text: String,
+    },
 }
 
 impl ToolReply {
@@ -231,10 +249,24 @@ impl ToolReply {
 
     /// Success carrying compact text content only.
     ///
-    /// Any serializable result is accepted.
+    /// Any serializable result is accepted. The value is serialized as JSON
+    /// first, so `ToolReply::text("hello")` puts the JSON string `"hello"` —
+    /// including its quotes — into the text block. Use
+    /// [`ToolReply::literal_text`] when the handler already has the characters
+    /// the client should read.
     #[must_use]
     pub fn text(value: impl Serialize) -> Self {
         Self::success_with(value, ToolPayload::Text)
+    }
+
+    /// Success carrying a literal text block, without an extra JSON quote layer.
+    ///
+    /// `ToolReply::literal_text("hello")` produces a text content block whose
+    /// value is `hello`. This constructor is additive and does not change
+    /// [`ToolReply::text`].
+    #[must_use]
+    pub fn literal_text(text: impl Into<String>) -> Self {
+        Self::Literal { text: text.into() }
     }
 
     /// Success carrying `structuredContent` without the text mirror.
@@ -395,6 +427,14 @@ pub trait ToolServer {
     /// every request.
     fn catalog_raw_ref(&mut self) -> Option<&RawValue> {
         None
+    }
+
+    /// Fatal registration problems that must refuse startup.
+    ///
+    /// Used by the convenience facade for duplicate tool names. Handwritten
+    /// [`ToolServer`] implementations inherit an empty slice.
+    fn registration_errors(&self) -> &[String] {
+        &[]
     }
 
     /// Reports whether `tools/list` should use [`ToolServer::catalog_page`].
@@ -741,6 +781,7 @@ fn tool_call_response(
         ToolReply::StructuredAny { value } => {
             protocol::tool_success_raw(id, &value, ToolPayload::Text)
         }
+        ToolReply::Literal { text } => protocol::tool_literal_text(id, text),
         ToolReply::Error(message) => protocol::tool_error(id, message),
     };
     if modern {
@@ -1153,6 +1194,10 @@ mod tests {
             r#"{"method":"initialize","id":-2,"jsonrpc":"2.0"}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"ok":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":"modern-list","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+            r#"{"jsonrpc":"2.0","id":"modern-call","method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"echo","arguments":{"modern":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":"modern-scalar","method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"scalar","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":"modern-bad","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
             r#"{"params":{"arguments":[1,2],"name":"fl\u0061t"},"method":"tools/call","id":4,"jsonrpc":"2.0"}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"missing"}}"#,
             r#"{"jsonrpc":"2.0","id":6}"#,

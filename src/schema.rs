@@ -122,6 +122,16 @@ pub(crate) fn reject_defects(defects: &[SchemaDefect]) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, message))
 }
 
+pub(crate) fn reject_messages(messages: &[String]) -> io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        messages.join("; "),
+    ))
+}
+
 fn inspect(tool: Option<&str>, node: &Value, path: &mut String, defects: &mut Vec<SchemaDefect>) {
     let Some(node) = node.as_object() else {
         return;

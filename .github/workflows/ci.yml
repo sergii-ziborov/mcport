@@ -19,9 +19,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-features
       - name: Stdio subprocess conformance
         run: cargo test --locked --features subprocess-tests --test stdio_subprocess
   msrv:
@@ -31,4 +31,4 @@ jobs:
       - name: Install MSRV toolchain
         run: rustup toolchain install 1.78 --profile minimal
       - name: Build at MSRV
-        run: cargo +1.78 build --locked
+        run: cargo +1.78 build --locked --all-features

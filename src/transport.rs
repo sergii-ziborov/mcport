@@ -167,6 +167,7 @@ pub(crate) fn serve_streams_bounded(
     writer: impl Write,
     limits: TransportLimits,
 ) -> io::Result<()> {
+    schema::reject_messages(server.registration_errors())?;
     schema::reject_defects(server.strict_schema_defects())?;
     serve_streams_impl::<true>(server, reader, writer, limits.validate()?, 1)
 }
@@ -177,6 +178,7 @@ pub(crate) fn serve_streams_configured(
     writer: impl Write,
     config: TransportConfig,
 ) -> io::Result<()> {
+    schema::reject_messages(server.registration_errors())?;
     schema::reject_defects(server.strict_schema_defects())?;
     let config = config.validate()?;
     match config.flush_policy {
