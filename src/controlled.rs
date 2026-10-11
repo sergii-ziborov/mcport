@@ -1435,7 +1435,7 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        assert!(lines(&writer).is_empty());
+        assert_eq!(lines(&writer), Vec::<Value>::new());
     }
 
     #[test]

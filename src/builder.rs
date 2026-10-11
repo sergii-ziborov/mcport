@@ -672,7 +672,7 @@ mod tests {
             }),
             |_: Value| ToolReply::text("planned"),
         );
-        assert!(honest.schema_defects().is_empty());
+        assert_eq!(honest.schema_defects(), []);
         assert!(honest.serve_streams(&b""[..], Vec::new()).is_ok());
     }
 
